@@ -1,0 +1,101 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using StardewCompanion.Protocol;
+
+namespace StardewCompanion.Core;
+
+public sealed partial class CompanionRuntime
+{
+    private Task? _planTask;
+    private CancellationTokenSource? _planCancellation;
+    private readonly HashSet<string> _planIds=new();
+    private long _decisionDue;
+    private long _decisionRevision;
+    private string _waitFingerprint="";
+    private string _lastActionFingerprint="";
+    private string _lastActionState="";
+    private int _unchangedFailures;
+    private string _lastFailureReason="";
+    private object? _lastPlan;
+    private readonly Queue<object> _queryFacts=new();
+
+    private static string FactFingerprint(GameObservation s)
+    {
+        var w=JsonNode.Parse(s.WorldView);
+        return JsonSerializer.Serialize(new{s.GameDay,s.Location,s.Tile,s.Stamina,s.Health,inventory=w?["inventory"],soil=w?["soil"],forage=w?["forage"],obstacles=w?["naturalObstacles"],chests=w?["chests"],water=w?["water"]});
+    }
+    private void WakeDecision(long revision=0)
+    {_decisionDue=Environment.TickCount64+200;_decisionRevision=Math.Max(_decisionRevision,revision);}
+    private object StartPlan(JsonObject args,string decision)
+    {
+        var s=_bridge.Observation!;
+        if(Mode=="plan_only"){SaveWorkPlan(args,args["steps"],false);return new{status="saved_plan_only",executed=false};}
+        if(!_resumed||_planTask is {IsCompleted:false}||s.ActiveTaskId!="")throw new InvalidOperationException("当前忙碌或已暂停，不能提交新计划");
+        var plan=ShortPlan.Parse(args,s.ControlMode=="solo_test"&&ControlModePolicy.CanControl(s));
+        if(s.Menu=="DialogueBox"&&plan.Steps[0].Skill!="respond_dialogue")
+            throw new InvalidOperationException("当前有未处理的对话弹窗；计划第一步必须按menuContext中的responseKey调用respond_dialogue");
+        SaveWorkPlan(args,args["steps"],false);
+        var key=_scope+":"+_session+":"+plan.Id;
+        if(_memory.Get(_scope,"plan_seen:"+_session+":"+plan.Id)!=null||!_planIds.Add(key)){
+            _decisionDue=Environment.TickCount64+5000;
+            var rejected=new{planId=plan.Id,status="duplicate_not_executed",reason="plan_id_already_submitted",originalFailure=_lastFailureReason,results=Array.Empty<object>(),unexecuted=plan.Steps};
+            RecordActionFeedback(rejected);return rejected;
+        }
+        _memory.Set(_scope,"plan_seen:"+_session+":"+plan.Id,"accepted");
+        _scopedPlanSkills=plan.Steps.Select(s=>s.Skill).Distinct().ToArray();_expandedTools=false;
+        _planCancellation?.Dispose();_planCancellation=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(args,"goal"));
+        return new{status="accepted",planId=plan.Id,steps=plan.Steps.Length};
+    }
+    private async Task ExecutePlan(ShortPlan plan,string decision,string scope,string session,int day,CancellationToken ct,string goal)
+    {
+        // Yield so StartPlan publishes the running task before any synchronous callback can complete it.
+        await Task.Yield();
+        var results=new List<object>();var status="completed";var reason="";
+        Trace("plan_started",new{planId=plan.Id,steps=plan.Steps,source="model"},decision);
+        try
+        {
+            for(var i=0;i<plan.Steps.Length;i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var step=plan.Steps[i];ValidateSkillScope(step.Skill,step.Arguments);var state=_bridge.Observation!;
+                if(!_resumed||scope!=_scope||session!=_session||day!=state.GameDay||!_bridge.Fresh||!ControlModePolicy.CanControl(state))
+                    throw new InvalidOperationException("plan_context_changed");
+                var signature=step.Skill+":"+step.Arguments.ToJsonString();
+                var facts=FactFingerprint(state);
+                if(signature==_lastActionFingerprint&&facts==_lastActionState&&_unchangedFailures>0)
+                    throw new InvalidOperationException("unchanged_target_previously_failed:"+_lastFailureReason+":目标及相关状态未变化，先解决阻塞或选择其他工作");
+                if(step.Skill=="authorize_test_chest")
+                {
+                    if(state.ControlMode!="solo_test"||state.Location!="Farm")throw new InvalidOperationException("test_chest_requires_solo_farm");
+                    await BindChest("开荒箱",step.Arguments["x"]!.GetValue<int>(),step.Arguments["y"]!.GetValue<int>(),
+                        new[]{"(O)24","(O)16","(O)18","(O)20","(O)22","(O)388","(O)390","(O)771","(O)92","(O)309","(O)310","(O)311","(O)770","(O)382","(O)330"},Array.Empty<string>(),ct);
+                    results.Add(new{step=i,skill=step.Skill,status="completed",reason="test_chest_bound"});continue;
+                }
+                var authorized=PermissionPolicy.Authorize(step.Skill,step.Arguments,_memory.Chests(scope),state);
+                var taskId=Guid.NewGuid().ToString("N");_taskDecisions[taskId]=decision;
+                Trace("permission_allowed",new{name=step.Skill,arguments=authorized,planId=plan.Id,step=i},decision);
+                Trace("task_dispatch",new{taskId,skill=step.Skill,arguments=authorized,source="model",planId=plan.Id,step=i},decision);
+                var receipt=await new ShortPlanExecutor(_bridge).Step(step.Skill,authorized,taskId,ct,plan.EncounterPolicy);
+                results.Add(new{step=i,receipt});
+                _lastActionFingerprint=signature;_lastActionState=FactFingerprint(_bridge.Observation!);
+                _unchangedFailures=receipt.Status!="completed"?1:0;
+                _lastFailureReason=receipt.Status!="completed"?receipt.Reason:"";
+                if(receipt.Status!="completed"){status="stopped";reason=receipt.Reason;break;}
+            }
+        }
+        catch(OperationCanceledException){status="cancelled";reason="pause_cancel_or_context_change";}
+        catch(Exception ex){status="stopped";reason=SafeError(ex);if(scope==_scope&&session==_session&&_resumed)await _bridge.Control("cancel");}
+        finally
+        {
+            var summary=new{planId=plan.Id,goal,status,reason,originalFailure=_lastFailureReason,results,unexecuted=plan.Steps.Skip(results.Count).ToArray()};
+            Decisions.Write(scope,session,decision,"plan_finished",summary);
+            RecordPlanEvidence(scope,plan.Id,summary,status=="completed"?"batch_completed":status);
+            if(scope==_scope&&session==_session){_lastPlan=summary;RecordActionFeedback(summary);WakeDecision();}
+        }
+    }
+    private object CompactObservation(GameObservation s)=>new{
+        s.Revision,s.GameDay,s.TimeOfDay,timeOfDayHHMM=$"{s.TimeOfDay/100:D2}:{s.TimeOfDay%100:D2}",minutesSinceMidnight=s.TimeOfDay/100*60+s.TimeOfDay%100,
+        clockMeaning="timeOfDay is HHMM-style game clock (e.g.1320 means 13:20), not elapsed minutes",s.ControlMode,s.Location,s.Tile,s.Stamina,s.Health,s.Menu,menuContext=JsonNode.Parse(s.MenuContext),s.ActiveTaskId,
+        world=JsonNode.Parse(s.WorldView),costMeaning="候选距离是本地估算；未知或未核验收益不能当成事实"};
+}

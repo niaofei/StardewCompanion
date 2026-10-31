@@ -1,0 +1,9 @@
+{
+  "Name": "Stardew Companion Bridge",
+  "Author": "StardewCompanion contributors",
+  "Version": "0.1.0-preview",
+  "Description": "Local task bridge for an independent AI farmhand. No custom content or save types.",
+  "UniqueID": "StardewCompanion.Bridge",
+  "EntryDll": "StardewCompanion.Mod.dll",
+  "MinimumApiVersion": "4.5.2"
+}

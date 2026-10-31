@@ -1,0 +1,9 @@
+{
+  "Name": "M0 Test Fixture - Development Only",
+  "Author": "StardewCompanion contributors",
+  "Version": "0.0.1",
+  "Description": "Creates a new dedicated M0 save using the game's normal new-game/save routines. Never ship this mod.",
+  "UniqueID": "StardewCompanion.TestFixture",
+  "EntryDll": "Fixture.dll",
+  "MinimumApiVersion": "4.5.2"
+}

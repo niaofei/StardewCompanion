@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/StardewCompanion.Core/StardewCompanion.Core.csproj" />
+    <Project Path="src/StardewCompanion.Desktop/StardewCompanion.Desktop.csproj" />
+    <Project Path="src/StardewCompanion.Diagnostics/StardewCompanion.Diagnostics.csproj" />
+    <Project Path="src/StardewCompanion.Mod/StardewCompanion.Mod.csproj" />
+    <Project Path="src/StardewCompanion.Fishing/StardewCompanion.Fishing.csproj" />
+    <Project Path="src/StardewMiningAgent/StardewMiningAgent.csproj" />
+    <Project Path="src/StardewMiningAgent.Verification/StardewMiningAgent.Verification.csproj" />
+    <Project Path="src/StardewCompanion.Protocol/StardewCompanion.Protocol.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Checks/Checks.csproj" />
+    <Project Path="tools/CoreChecks/CoreChecks.csproj" />
+    <Project Path="tools/Fixture/Fixture.csproj" />
+  </Folder>
+</Solution>

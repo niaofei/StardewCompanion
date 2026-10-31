@@ -1,0 +1,19 @@
+﻿.tools/
+.local/
+artifacts/
+**/bin/
+**/obj/
+.vs/
+*.user
+*.log
+
+
+# Local secrets and signing material
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+secrets.json
+*.pfx
+*.snk
+*.pem
