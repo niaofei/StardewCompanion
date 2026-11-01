@@ -8,13 +8,13 @@ public static class PermissionPolicy
     public static JsonObject Authorize(string skill,JsonObject args,IReadOnlyList<ChestBinding> chests,GameObservation state)
     {
         if(skill=="mine_travel")throw new InvalidOperationException("skill_disabled:mine_travel");
+        ToolCatalog.ValidateArguments(skill,args);
         if(BusinessCapabilities.Find(skill) is {} business){
             if(!ControlModePolicy.CanControl(state))throw new InvalidOperationException("capability_not_available:"+skill);
             using var doc=System.Text.Json.JsonDocument.Parse(args.ToJsonString());ContractValidation.Validate(business,doc.RootElement);
             var bound=(JsonObject)args.DeepClone();bound["_bindings"]=System.Text.Json.JsonSerializer.SerializeToNode(chests);return bound;
         }
-        if(!ToolCatalog.Actions.Contains(skill)&&!ToolCatalog.OpeningActions.Contains(skill))throw new InvalidOperationException("未注册的技能");
-        if(ToolCatalog.OpeningActions.Contains(skill)&&!(state.IsHost&&state.ControlMode=="solo_test"&&ControlModePolicy.CanControl(state)))throw new InvalidOperationException("开荒技能仅限隔离单人测试档");
+        if(!ToolCatalog.Actions.Contains(skill))throw new InvalidOperationException("未注册的技能");
         var copy=(JsonObject)args.DeepClone();
         if(skill is "deposit_items" or "withdraw_items")
         {

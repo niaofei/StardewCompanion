@@ -22,6 +22,12 @@ internal sealed partial class BusinessExecutor
                 yield return new("go_to",new{location="Blacksmith",x=3,y=13});
                 yield return Native(_skill,_args);break;
             case "order_building":case "modify_building":
+                if(_skill=="order_building"){
+                    if(!Game1.buildingData.TryGetValue(Text("buildingType"),out var definition))throw new InvalidOperationException("building_type_unknown");
+                    if(!string.IsNullOrEmpty(definition.BuildingToUpgrade))throw new InvalidOperationException("use_modify_building_for_upgrade");
+                    if(definition.BuildCost>Num("maxCost")||definition.BuildCost>Game1.player.Money)throw new InvalidOperationException("building_budget_exceeded");
+                    foreach(var material in IngredientSources(definition.BuildMaterials?.ToDictionary(m=>m.ItemId,m=>m.Amount)??new Dictionary<string,int>(),1,false))yield return material;
+                }
                 yield return new("go_to",new{location="ScienceHouse",x=8,y=18});
                 yield return Native(_skill,_args);break;
             case "tend_animals":

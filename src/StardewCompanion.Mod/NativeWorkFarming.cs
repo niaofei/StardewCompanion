@@ -8,12 +8,18 @@ using StardewValley.Menus;
 using StardewValley.Objects;
 using StardewValley.TerrainFeatures;
 using StardewValley.Tools;
+using StardewValley.Buildings;
 
 namespace StardewCompanion.Mod;
 
 internal sealed partial class NativeWorkExecutor
 {
     private int _recoveryStartMinutes=-1;
+    private readonly HashSet<Guid> _pettedIds=new();
+    private readonly HashSet<Guid> _wateredBowlIds=new();
+    private HashSet<Debris>? _petGiftBaseline;
+    private long _petGiftDeadline;
+    private PetBowl? _wateringBowl;
     private string FarmingExtras(AiInputSimulator input)
     {
         if(_action=="water_coverage"){
@@ -23,6 +29,7 @@ internal sealed partial class NativeWorkExecutor
             return End("water_now_requires_explicit_plot_region");
         }
         if(_action=="forage_extras"){
+            if(Game1.currentLocation.NameOrUniqueName!=Map){var move=_nav.Move(Map,new(Num("x"),Num("y")),input,_interact);return move is "blocked" or "unsupported"?End("forage_stop_unreachable"):"running";}
             var cells=Enumerable.Range(Num("x"),Num("width")).SelectMany(x=>Enumerable.Range(Num("y"),Num("height")).Select(y=>new GridPoint(x,y)));
             foreach(var tile in cells.Where(t=>!_done.Contains(t))){
                 var l=Game1.currentLocation;var point=new Vector2(tile.X,tile.Y);
@@ -79,12 +86,21 @@ internal sealed partial class NativeWorkExecutor
     }
     private string Animals(AiInputSimulator input)
     {
+        if(_action=="animal_door"||_action=="livestock"&&Text("operation")=="door"){
+            var building=Game1.getFarm().buildings.FirstOrDefault(b=>b.GetIndoors()?.NameOrUniqueName==Map||b.id.Value.ToString()==Text("buildingId"));
+            if(building==null)return End("animal_building_not_found");if(Text("door")=="unchanged"||building.animalDoorOpen.Value==(Text("door")=="open"))return Finish("door_already_requested_state");
+            var point=new GridPoint(building.tileX.Value+building.animalDoor.X,building.tileY.Value+building.animalDoor.Y);var move=Near("Farm",point,input);
+            if(move is "blocked" or "unsupported")return End("animal_door_unreachable");if(move!="reached")return "running";_interact(point);
+            if(building.animalDoorOpen.Value!=(Text("door")=="open"))return End("animal_door_change_not_verified");Completed=1;return Finish("animal_door_verified");
+        }
         if(Game1.currentLocation.NameOrUniqueName!=Map){var move=_nav.Move(Map,new(3,5),input,_interact);return move is "blocked" or "unsupported"?End("animal_location_unreachable"):"running";}
         var l=Game1.currentLocation;
         if(_action=="feed"){
             if(l is not AnimalHouse house)return End("animal_house_required");
-            var before=Count("(O)178");house.feedAllAnimals();
-            Completed=Math.Max(0,before-Count("(O)178"));return Finish("native_feeding_processed");
+            var before=house.objects.Values.Count(o=>o.QualifiedItemId=="(O)178");house.feedAllAnimals();
+            Completed=Math.Max(0,house.objects.Values.Count(o=>o.QualifiedItemId=="(O)178")-before);
+            var emptyTrough=false;for(var x=0;x<house.Map.Layers[0].LayerWidth;x++)for(var y=0;y<house.Map.Layers[0].LayerHeight;y++)if(house.doesTileHaveProperty(x,y,"Trough","Back")!=null&&!house.objects.ContainsKey(new(x,y)))emptyTrough=true;
+            return emptyTrough?End("silo_hay_insufficient_for_trough"):Finish("native_feeding_verified");
         }
         if(_action=="animal_door"){
             var building=Game1.getFarm().buildings.FirstOrDefault(b=>b.GetIndoors()?.NameOrUniqueName==Map);
@@ -117,17 +133,53 @@ internal sealed partial class NativeWorkExecutor
             if(grabber.Value==null)return Finish("grabbers_processed");
             var point=new GridPoint((int)grabber.Key.X,(int)grabber.Key.Y);var near=Near(Map,point,input);if(near is "blocked" or "unsupported")return End("grabber_unreachable");
             if(Game1.activeClickableMenu is ItemGrabMenu menu){
-                _ownedMenu=menu;var index=menu.ItemsToGrabMenu.actualInventory.ToList().FindIndex(i=>i!=null);
-                if(index<0){menu.exitThisMenu();_done.Add(point);return "running";}
-                var click=menu.ItemsToGrabMenu.inventory[index].bounds.Center;menu.receiveRightClick(click.X,click.Y);Completed++;return "running";
+                var collected=CollectNativeMenu(menu);if(collected=="completed"){_done.Add(point);return "running";}return collected;
             }
             if(near=="reached")_interact(point);return "running";
         }
         if(_action=="pets"){
-            var pet=l.characters.OfType<Pet>().FirstOrDefault(p=>!_done.Contains(new(p.TilePoint.X,p.TilePoint.Y)));
-            if(pet==null)return Flag("waterBowls")?End("pet_water_bowls_require_explicit_target_support"):Finish("pets_processed");
-            var point=new GridPoint(pet.TilePoint.X,pet.TilePoint.Y);var near=Near(Map,point,input);if(near is "blocked" or "unsupported"){_done.Add(point);return "running";}if(near!="reached")return "running";
-            if(Flag("pet"))pet.checkAction(Game1.player,l);_done.Add(point);Completed++;return "running";
+            _petGiftBaseline??=l.debris.ToHashSet();
+            var ids=_args.GetProperty("petIds").EnumerateArray().Select(v=>v.GetString()).ToHashSet();
+            var pets=l.characters.OfType<Pet>().Where(p=>ids.Count==0||ids.Contains(p.petId.Value.ToString())).ToArray();
+            if(ids.Count>0&&ids.Any(id=>!pets.Any(p=>p.petId.Value.ToString()==id)))return End("pet_id_not_observed_here");
+            var pet=Flag("pet")?pets.FirstOrDefault(p=>!_pettedIds.Contains(p.petId.Value)):null;
+            if(pet!=null){
+                if(pet.lastPetDay.TryGetValue(Game1.player.UniqueMultiplayerID,out var day)&&day==Game1.Date.TotalDays){_pettedIds.Add(pet.petId.Value);return "running";}
+                var point=new GridPoint(pet.TilePoint.X,pet.TilePoint.Y);var near=Near(Map,point,input);if(near is "blocked" or "unsupported")return End("pet_unreachable");if(near!="reached")return "running";
+                Game1.player.CurrentToolIndex=EmptyHand();pet.checkAction(Game1.player,l);
+                if(!pet.lastPetDay.TryGetValue(Game1.player.UniqueMultiplayerID,out day)||day!=Game1.Date.TotalDays)return End("petting_not_verified");
+                _pettedIds.Add(pet.petId.Value);Completed++;_petGiftDeadline=Environment.TickCount64+15000;return "running";
+            }
+            if(Flag("collectGifts")){
+                var gift=l.debris.FirstOrDefault(d=>!_petGiftBaseline.Contains(d)&&d.Chunks.Count>0&&(d.item!=null||!string.IsNullOrEmpty(d.itemId.Value)));
+                if(gift!=null){
+                    if(Environment.TickCount64>=_petGiftDeadline)return End("pet_gift_pickup_timeout_or_inventory_full");
+                    var chunk=gift.Chunks.First();var point=new GridPoint((int)((chunk.position.X+32)/64),(int)((chunk.position.Y+32)/64));var goal=Navigation.Passable(point)?point:_nav.BestAdjacent(point);
+                    if(goal==null)return End("pet_gift_unreachable");var moved=_nav.Move(Map,goal.Value,input,_interact);return moved is "blocked" or "unsupported"?End("pet_gift_unreachable"):"running";
+                }
+            }
+            if(Flag("waterBowls")){
+                if(_wateringBowl!=null){
+                    if(_wateringBowl.watered.Value){_wateredBowlIds.Add(_wateringBowl.id.Value);_wateringBowl=null;_wait=0;Completed++;}
+                    else if(Environment.TickCount64<_wait)return "running";
+                    else return End("pet_bowl_watering_not_verified");
+                }
+                var bowls=l.buildings.OfType<PetBowl>().Where(b=>ids.Count==0||ids.Contains(b.petId.Value.ToString())).ToArray();
+                if(bowls.Length==0)return End("pet_bowl_not_observed_here");
+                var bowl=bowls.FirstOrDefault(b=>!b.watered.Value&&!_wateredBowlIds.Contains(b.id.Value));
+                if(bowl!=null){
+                    GridPoint? tile=null;
+                    for(var x=bowl.tileX.Value;x<bowl.tileX.Value+bowl.tilesWide.Value;x++)for(var y=bowl.tileY.Value;y<bowl.tileY.Value+bowl.tilesHigh.Value;y++){
+                        string property=null!;if(bowl.doesTileHaveProperty(x,y,"PetBowl","Buildings",ref property))tile=new(x,y);
+                    }
+                    if(tile==null)return End("pet_bowl_water_tile_missing");var near=Near(Map,tile.Value,input);if(near is "blocked" or "unsupported")return End("pet_bowl_unreachable");if(near!="reached")return "running";
+                    if(_wait!=0){if(Environment.TickCount64<_wait)return "running";return End("pet_bowl_watering_not_verified");}
+                    var can=Game1.player.Items.OfType<WateringCan>().FirstOrDefault();if(can==null||can.WaterLeft<=0)return End("watering_can_missing_or_empty");
+                    Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(can);Face(tile.Value);input.Tool=true;_wateringBowl=bowl;_wait=Environment.TickCount64+1500;return "running";
+                }
+                if(_wait!=0){Completed++;_wait=0;}
+            }
+            return Finish("requested_pet_care_verified");
         }
         return End("animal_action_not_supported");
     }

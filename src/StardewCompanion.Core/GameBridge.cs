@@ -41,9 +41,20 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
     public event Action<GameObservation>? Observed;
     public event Action<TaskResult>? Result;
     public string Endpoint { get; private set; } = "";
-    public string Token { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+    public string Token { get; private set; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     public async Task Start(string sessionFile, int port = 27841)
     {
+        // Keep an already running game able to reconnect after its frontend restarts.
+        if(File.Exists(sessionFile)){
+            try{
+                using var previous=JsonDocument.Parse(File.ReadAllText(sessionFile));
+                var root=previous.RootElement;
+                if(root.TryGetProperty("endpoint",out var endpoint)&&endpoint.GetString()==$"ws://127.0.0.1:{port}/bridge"
+                    &&root.TryGetProperty("token",out var token)&&token.ValueKind==JsonValueKind.String
+                    &&token.GetString() is {Length:64} value&&value.All(Uri.IsHexDigit))Token=value;
+            }
+            catch(Exception ex)when(ex is IOException or JsonException or UnauthorizedAccessException){ }
+        }
         var builder = WebApplication.CreateBuilder(); builder.Logging.ClearProviders();
         builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         _app = builder.Build(); _app.UseWebSockets();

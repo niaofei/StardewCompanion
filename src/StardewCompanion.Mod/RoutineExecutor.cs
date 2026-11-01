@@ -14,9 +14,9 @@ namespace StardewCompanion.Mod;
 
 internal sealed class RoutineExecutor
 {
-    internal static readonly string[] Skills = new[]{ "go_to", "go_to_and_collect", "follow_player", "return_home", "sleep", "water_area", "harvest_area", "refill_water", "forage_area", "deposit_items", "withdraw_items", "fish_at", "fight_enemies", "mine_travel" }.Concat(OpeningExecutor.Skills).Concat(BusinessCapabilities.All.Where(c=>!c.Query).Select(c=>c.Name)).ToArray();
-    private readonly OpeningExecutor? _opening;
+    internal static readonly string[] Skills = new[]{ "go_to", "follow_player", "return_home", "sleep", "water_area", "harvest_area", "refill_water", "forage_area", "clear_area", "till_area", "plant_area", "deposit_items", "withdraw_items", "fish_at", "fight_enemies", "mine_travel" }.Concat(BusinessCapabilities.All.Where(c=>!c.Query).Select(c=>c.Name)).ToArray();
     private readonly BusinessExecutor? _business;
+    private readonly AreaActionExecutor? _areaAction;
     private readonly SpecialActivityExecutor? _activity;
     private SpecialActivityExecutor? _encounterActivity;
     private readonly List<object> _encounterResults=new();
@@ -26,8 +26,8 @@ internal sealed class RoutineExecutor
     private readonly HashSet<Debris> _visitedRouteDrops=new();
     private readonly Dictionary<string,int> _routeItemGains=new();
     private Debris? _activeRouteDrop;
-    private long _activeRouteDropDeadline;
     private long _activeRouteDropWait;
+    private long _activeRouteDropDeadline;
     private int _uncollectedRouteDrops;
     internal object? BusinessDetails=>_business==null&&_activity==null&&_encounterResults.Count==0&&_storageTransfers.Count==0&&_routeDropResults.Count==0?null:new{stages=_business?.Stages.AsEnumerable()??Array.Empty<object>(),activity=_activity?.Details,encounters=_encounterResults.ToArray(),skipped=_business?.Skipped.AsEnumerable()??Array.Empty<object>(),storageTransfers=_storageTransfers.ToArray(),routeDrops=_routeDropResults.ToArray()};
     private readonly string _skill;
@@ -54,8 +54,8 @@ internal sealed class RoutineExecutor
     private HashSet<Debris> _debrisBefore = new();
     private readonly Dictionary<string,int> _actionGains = new();
     private readonly Dictionary<string,int> _collectedItems=new();
-    internal Dictionary<string,int> CollectedItems=>_business?.CollectedItems??_opening?.CollectedItems??_collectedItems;
-    internal object[] AffectedTiles=>_business?.AffectedTiles??_opening?.AffectedTiles??_done.Select(p=>(object)new{x=p.X,y=p.Y}).ToArray();
+    internal Dictionary<string,int> CollectedItems=>_business?.CollectedItems??_areaAction?.CollectedItems??_collectedItems;
+    internal object[] AffectedTiles=>_business?.AffectedTiles??_areaAction?.AffectedTiles??_done.Select(p=>(object)new{x=p.X,y=p.Y}).ToArray();
     internal object[] RemainingDrops()=>!StardewModdingAPI.Context.IsWorldReady||!_acted||_skill is not ("harvest_area" or "forage_area")?Array.Empty<object>():PendingDrops().Select(d=>(object)new{
         id=d.item?.QualifiedItemId??d.itemId.Value,type=d.debrisType.Value.ToString(),
         chunks=d.Chunks.Select(c=>new{x=c.position.X,y=c.position.Y}).ToArray()}).ToArray();
@@ -71,19 +71,19 @@ internal sealed class RoutineExecutor
         _skill = skill; using var json = JsonDocument.Parse(arguments); _args = json.RootElement.Clone();
         _encounterPolicy=encounterPolicy is "fight" or "avoid" or "interrupt"?encounterPolicy:"interrupt";
         _nav.AvoidMonsters=_encounterPolicy=="avoid";
-        if(OpeningExecutor.Skills.Contains(skill))_opening=new(skill,arguments,interact);
         if(BusinessCapabilities.Find(skill) is {Query:false})_business=new(skill,arguments,interact);
+        if(skill is "clear_area" or "till_area" or "plant_area")_areaAction=new(skill,arguments,interact);
         if(skill is "fish_at" or "fight_enemies" or "mine_travel")_activity=new(skill,arguments,interact);
         if (_args.ValueKind != JsonValueKind.Object) throw new JsonException("Arguments must be an object");
         _interact = interact; _day = Game1.Date.TotalDays;
         if (skill is "deposit_items" or "withdraw_items")
         { Text("chestId"); Text("itemId"); if (Number("count", 0) is < 1 or > 9999) throw new JsonException("Invalid item count"); }
         if (skill == "follow_player" && !long.TryParse(Text("playerId"), out _)) throw new JsonException("Invalid player identity");
-        if (skill is "go_to" or "go_to_and_collect") { Text("location"); Number("x"); Number("y"); }
-        if(skill=="go_to_and_collect"&&Number("pickupRadius") is <0 or >8)throw new JsonException("Invalid pickup radius");
-        if(skill=="go_to_and_collect")_inventoryBefore=InventorySnapshot();
+        if (skill == "go_to") { Text("location"); Number("x"); Number("y"); }
+        if(skill=="go_to"&&Flag("collect")&&(Number("pickupRadius",2) is <0 or >8))throw new JsonException("Invalid pickup radius");
+        if(skill=="go_to"&&Flag("collect"))_inventoryBefore=InventorySnapshot();
         if (skill.EndsWith("_area"))
-        { Text("location"); Number("x"); Number("y"); if (Number("width", 1) is < 1 or > 120 || Number("height", 1) is < 1 or > 120) throw new JsonException("Invalid area dimensions"); }
+        { Text("location"); Number("x"); Number("y"); if (Number("width", 1) is < 1 or > 32 || Number("height", 1) is < 1 or > 32) throw new JsonException("Invalid area dimensions"); }
     }
     private string Text(string key) => _args.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(v.GetString()) ? v.GetString()! : throw new JsonException("Missing " + key);
     private int Number(string key, int? fallback = null) => _args.TryGetProperty(key, out var v) ? v.GetInt32() : fallback ?? throw new JsonException("Missing " + key);
@@ -95,7 +95,7 @@ internal sealed class RoutineExecutor
     {
         var now = Environment.TickCount64;
         if(Game1.Date.TotalDays!=_day){
-            if(_skill=="sleep"){Reason="new_day_observed";return "completed";}
+            if(_skill=="sleep"||_skill=="end_day"&&Flag("sleep")||_skill=="recover"&&Text("method")=="sleep"){Reason="new_day_observed";return "completed";}
             return End("native_day_changed_replan_required:原版已换日，请根据新状态决定后续工作");
         }
         if(_skill!="fight_enemies"&&Game1.currentLocation is MineShaft&&Game1.currentLocation.characters.OfType<Monster>().Any(m=>m.Health>0))
@@ -118,7 +118,7 @@ internal sealed class RoutineExecutor
         }
         if(_activity!=null){var status=_activity.Tick(input);Completed=_activity.Completed;Reason=_activity.Reason;Phase=_activity.Phase;return status;}
         if(_business!=null){var status=_business.Tick(input);Completed=_business.Completed;Reason=_business.Reason;Phase=_business.Phase;return status;}
-        if(_opening!=null){var status=_opening.Tick(input);Completed=_opening.Completed;Reason=_opening.Reason;Phase=_opening.Phase;return status;}
+        if(_areaAction!=null){var status=_areaAction.Tick(input);Completed=_areaAction.Completed;Reason=_areaAction.Reason;Phase=_areaAction.Phase;return status;}
         if (_skill == "sleep" && Game1.Date.TotalDays != _day) { Reason = "new_day_observed"; return "completed"; }
         if (Game1.eventUp || !Game1.player.CanMove || Game1.player.UsingTool || Game1.activeClickableMenu != null)
         {
@@ -138,7 +138,7 @@ internal sealed class RoutineExecutor
         }
         _menuWait = 0;
         if (!WorldView.Supported(Game1.currentLocation)) return End("unsupported_map");
-        if (_skill is "go_to" or "go_to_and_collect" or "return_home" or "sleep" or "follow_player") return Travel(input);
+        if (_skill is "go_to" or "return_home" or "sleep" or "follow_player") return Travel(input);
         if (_skill is "deposit_items" or "withdraw_items") return Storage(input);
         if (_skill == "refill_water" || _refillTarget != null) return Refill(input, _skill == "water_area");
         if (Game1.currentLocation.NameOrUniqueName != Map)
@@ -164,10 +164,8 @@ internal sealed class RoutineExecutor
                         if(chunk!=null)
                         {
                             var dropTile=new GridPoint((int)(chunk.position.X+32)/64,(int)(chunk.position.Y+32)/64);
-                            // Native pickup works from a reachable neighbor, even if the item's tile is disconnected.
-                            if(Navigation.Current.Distance(dropTile)>1)
                             {
-                                var goal=_nav.BestAdjacent(dropTile);
+                                GridPoint? goal=Navigation.Passable(dropTile)?dropTile:_nav.BestAdjacent(dropTile);
                                 if(goal==null)return End("harvest_drop_unreachable");
                                 var pickup=_nav.Move(Map,goal.Value,input,_interact);
                                 if(pickup is "blocked" or "unsupported")return End("harvest_drop_unreachable");
@@ -191,6 +189,14 @@ internal sealed class RoutineExecutor
             _target = batch[0]; _approach = _nav.BestAdjacent(_target.Value);
             if (_approach == null) return End("target_unreachable");
         }
+        var can = Game1.player.Items.OfType<WateringCan>().FirstOrDefault();
+        if (_skill == "water_area" && (can == null || can.WaterLeft == 0))
+        {
+            if(can==null)return End("tool_missing");
+            if(!Flag("autoRefill"))return End("watering_can_empty:autoRefill=false");
+            _target=null;_approach=null;_nextTargetScan=0;_refillTarget=null;_refillApproach=null;_refillWait=0;_nav.Reset();
+            return Refill(input, true);
+        }
         Phase = "approach_target";
         var move = _nav.Move(Map, _approach!.Value, input, _interact);
         if (move is "blocked" or "unsupported") return End(_nav.Reason);
@@ -198,8 +204,6 @@ internal sealed class RoutineExecutor
         var tile = _target.Value;
         // Player may finish a target while AI is approaching. Don't repeat the action.
         if (Satisfied(tile)) { _done.Add(tile); _target = null; _approach = null; _nav.Reset(); return "running"; }
-        var can = Game1.player.Items.OfType<WateringCan>().FirstOrDefault();
-        if (_skill == "water_area" && can?.WaterLeft == 0) return Refill(input, true);
         if (_skill == "refill_water") return Refill(input, false);
         var isScythe = _skill == "harvest_area" && GetSoil(tile)?.crop?.GetHarvestMethod() == StardewValley.GameData.Crops.HarvestMethod.Scythe;
         Tool? tool = _skill == "water_area" ? can : isScythe ? Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(w => w.isScythe()) : null;
@@ -250,18 +254,18 @@ internal sealed class RoutineExecutor
             if (map == Game1.currentLocation.NameOrUniqueName) goal = _nav.BestAdjacent(goal) ?? goal;
         }
         else { map = Text("location"); goal = new(Number("x"), Number("y")); }
-        if(_skill=="go_to_and_collect")
+        if(_skill=="go_to"&&Flag("collect"))
         {
             var collection=CollectAlongRoute(map,input);
             if(collection!=null)return collection;
         }
         Phase = "walking";
-        var state = _nav.Move(map, goal, input, _interact, (_skill is "go_to" or "go_to_and_collect")&&Flag("breakNaturalObstacles"));
+        var state = _nav.Move(map, goal, input, _interact, _skill=="go_to"&&Flag("breakNaturalObstacles"));
         if (state is "blocked" or "unsupported") return End(_nav.Reason);
         if (state != "reached" || _skill == "follow_player") return "running";
         if (_skill == "sleep") { Phase = "enter_bed"; input.Direction = "right"; return "running"; }
-        if(_skill=="go_to_and_collect"&&_uncollectedRouteDrops>0)
-        {Reason="destination_reached_with_uncollected_route_drops";return "partial";}
+        if(_skill=="go_to"&&Flag("collect")&&_uncollectedRouteDrops>0)
+        {Reason="destination_reached_with_uncollected_route_drops";return "completed";}
         Reason = "destination_observed"; return "completed";
     }
     private string? CollectAlongRoute(string destination,AiInputSimulator input)
@@ -272,17 +276,14 @@ internal sealed class RoutineExecutor
         if(path==null)return null;
         if(_activeRouteDrop!=null)
         {
+            if(Environment.TickCount64>=_activeRouteDropDeadline){
+                _visitedRouteDrops.Add(_activeRouteDrop);_routeDropResults.Add(new{state="skipped",reason="pickup_timeout_or_inventory_full",itemId=_activeRouteDrop.item?.QualifiedItemId??_activeRouteDrop.itemId.Value});
+                _uncollectedRouteDrops++;_activeRouteDrop=null;_nav.Reset();return "running";
+            }
             if(!location.debris.Contains(_activeRouteDrop)||_activeRouteDrop.Chunks.Count==0)
             {
                 _visitedRouteDrops.Add(_activeRouteDrop);CaptureRouteItems();
                 _routeDropResults.Add(new{state="picked_up",itemId=_activeRouteDrop.item?.QualifiedItemId??_activeRouteDrop.itemId.Value});
-                _activeRouteDrop=null;_activeRouteDropWait=0;_nav.Reset();return "running";
-            }
-            if(Environment.TickCount64>_activeRouteDropDeadline)
-            {
-                _visitedRouteDrops.Add(_activeRouteDrop);CaptureRouteItems();
-                _routeDropResults.Add(new{state="not_collected",reason="pickup_timeout_or_inventory_full",itemId=_activeRouteDrop.item?.QualifiedItemId??_activeRouteDrop.itemId.Value});
-                _uncollectedRouteDrops++;
                 _activeRouteDrop=null;_activeRouteDropWait=0;_nav.Reset();return "running";
             }
             var chunk=_activeRouteDrop.Chunks.OrderBy(c=>Vector2.DistanceSquared(c.position.Value,Game1.player.Position)).First();
@@ -309,13 +310,13 @@ internal sealed class RoutineExecutor
             }
             return "running";
         }
-        var radius=Number("pickupRadius");
+        var radius=Number("pickupRadius",2);
         var candidate=location.debris.Where(d=>!_visitedRouteDrops.Contains(d)&&d.Chunks.Count>0&&(d.item!=null||!string.IsNullOrEmpty(d.itemId.Value)))
             .Select(d=>new{drop=d,tiles=d.Chunks.Select(c=>new GridPoint((int)((c.position.X+32)/64),(int)((c.position.Y+32)/64))).ToArray()})
             .Where(d=>d.tiles.Any(tile=>path.Min(p=>DistanceSquared(p,tile))<=radius*radius))
             .OrderBy(d=>d.tiles.Min(tile=>Navigation.Current.Distance(tile))).FirstOrDefault();
         if(candidate==null)return null;
-        _activeRouteDrop=candidate.drop;_activeRouteDropDeadline=Environment.TickCount64+7000;_activeRouteDropWait=0;_nav.Reset();
+        _activeRouteDrop=candidate.drop;_activeRouteDropWait=0;_activeRouteDropDeadline=Environment.TickCount64+15000;_nav.Reset();
         return "running";
     }
     private static int DistanceSquared(GridPoint a,GridPoint b)
@@ -344,7 +345,6 @@ internal sealed class RoutineExecutor
         }
         if (_skill == "forage_area")
         {
-            if (!Game1.currentLocation.IsOutdoors) yield break;
             foreach (var p in Game1.currentLocation.objects.Pairs)
             { var tile = new GridPoint((int)p.Key.X, (int)p.Key.Y); if (InArea(tile) && p.Value.IsSpawnedObject && p.Value.isForage()) yield return tile; }
             yield break;
@@ -368,7 +368,7 @@ internal sealed class RoutineExecutor
     internal void CaptureCompleted()
     {
         if(_business!=null){_business.Capture();return;}
-        if(_opening!=null){_opening.Capture();return;}
+        if(_areaAction!=null){_areaAction.Capture();return;}
         if(!StardewModdingAPI.Context.IsWorldReady||!_acted||_target==null||Game1.currentLocation.NameOrUniqueName!=Map||!Satisfied(_target.Value))return;
         if(_skill=="water_area") { if(!_actionVerified&&GetSoil(_target.Value)?.state.Value==1){Completed++;_actionVerified=true;_done.Add(_target.Value);}return; }
         if(_skill is not ("harvest_area" or "forage_area"))return;
@@ -405,6 +405,7 @@ internal sealed class RoutineExecutor
         {
             if (Environment.TickCount64 < _refillWait) return "running";
             if (can.WaterLeft <= _before) return End("refill_not_verified");
+            if(continueWater&&can.WaterLeft<40){_refillWait=0;return "running";}
             _refillTarget = null; _refillWait = 0; _nav.Reset();
             if (continueWater) return "running";
             Completed++; Reason = "water_refilled"; return "completed";
@@ -473,7 +474,7 @@ internal sealed class RoutineExecutor
             if (item.IsRecipe || item.QualifiedItemId is "(O)434" or "(O)326") { menu.receiveKeyPress(Keys.Escape); return End("item_has_consumption_side_effect"); }
             eligibleSourceFound = true;
             var amount = Math.Min(remaining, item.Stack);
-            var moved = MoveStack(item, amount, destination);
+            var moved = MoveStack(item, amount, destination, _skill == "deposit_items" ? chest.GetActualCapacity() : Game1.player.MaxItems);
             if (moved > 0)
             {
                 item.Stack -= moved;
@@ -490,35 +491,21 @@ internal sealed class RoutineExecutor
         _storageTransfers.Add(new{direction=_skill=="deposit_items"?"to_chest":"from_chest",itemId,quality=quality<0?(int?)null:quality,count=transferred,chestId=id});
         Completed += transferred;
         Phase = "transfer_items";
-        return Completed >= Number("count") ? "completed" : "running";
+        if(Completed>=Number("count")){Reason="transfer_verified";return "completed";}return "running";
     }
-    private static int MoveStack(Item source, int amount, IList<Item> destination)
+    private static int MoveStack(Item source, int amount, IList<Item> destination, int capacity)
     {
-        var remaining = amount;
-        foreach (var target in destination)
-        {
-            if (target == null || !target.canStackWith(source)) continue;
-            var moved = Math.Min(remaining, target.maximumStackSize() - target.Stack);
-            if (moved <= 0) continue;
-            target.Stack += moved; remaining -= moved;
-            if (remaining == 0) return amount;
-        }
-        for (var i = 0; i < destination.Count && remaining > 0; i++)
-        {
-            if (destination[i] != null) continue;
-            var moved = Math.Min(remaining, source.maximumStackSize());
-            var copy = source.getOne(); copy.Stack = moved; destination[i] = copy;
-            remaining -= moved;
-        }
-        return amount - remaining;
+        var copy = source.getOne(); copy.Stack = amount;
+        var remainder = Utility.addItemToThisInventoryList(copy, destination, capacity);
+        return amount - (remainder?.Stack ?? 0);
     }
     internal bool Cleanup()
     {
         _disposed=true;
         SpecialActivityExecutor.ClearActiveFishing();
         if(!StardewModdingAPI.Context.IsWorldReady)return true;
-        if(_opening?.Cleanup()==false)return false;
         if(_business?.Cleanup()==false)return false;
+        if(_areaAction?.Cleanup()==false)return false;
         if(_ownedChest==null)return true;
         if(Game1.activeClickableMenu is ItemGrabMenu menu && ReferenceEquals(menu.sourceItem,_ownedChest))
         {

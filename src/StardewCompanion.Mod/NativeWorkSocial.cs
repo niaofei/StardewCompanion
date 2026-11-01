@@ -5,6 +5,7 @@ using StardewValley;
 using StardewValley.Locations;
 using StardewValley.Menus;
 using StardewValley.Objects;
+using StardewValley.Quests;
 
 namespace StardewCompanion.Mod;
 
@@ -66,10 +67,12 @@ internal sealed partial class NativeWorkExecutor
     }
     private string Quests(AiInputSimulator input)
     {
+        if(Game1.currentLocation.NameOrUniqueName!=Map){var move=_nav.Move(Map,new(3,8),input,_interact);return move is "blocked" or "unsupported"?End("quest_location_unreachable"):"running";}
         var quest=Game1.player.questLog.FirstOrDefault(q=>q.id.Value==Text("questId"));
         if(Text("operation")=="accept"){
             var tile=FindAction(a=>a.Contains("Quest")||a.Contains("SpecialOrders"));
             if(Game1.activeClickableMenu is Billboard board){
+                if(Game1.questOfTheDay?.id.Value!=Text("questId"))return End("requested_quest_not_on_board");
                 _ownedMenu=board;var accept=Read(board,"acceptQuestButton") as ClickableComponent;
                 if(accept==null)return End("quest_accept_option_not_available");
                 var p=accept.bounds.Center;board.receiveLeftClick(p.X,p.Y);
@@ -81,6 +84,8 @@ internal sealed partial class NativeWorkExecutor
         }
         if(quest==null)return End("quest_not_active");
         if(Text("operation")=="deliver"){
+            if(quest is not ItemDeliveryQuest delivery)return End("quest_delivery_type_requires_specific_adapter");
+            if(delivery.target.Value!=Text("npc"))return End("quest_delivery_npc_mismatch");
             var npc=Game1.currentLocation.characters.FirstOrDefault(n=>n.Name==Text("npc"));if(npc==null)return End("quest_npc_not_observed");
             var tile=new GridPoint(npc.TilePoint.X,npc.TilePoint.Y);var near=Near(Map,tile,input);if(near is "blocked" or "unsupported")return End("quest_npc_unreachable");if(near!="reached")return "running";
             if(Game1.activeClickableMenu is DialogueBox dialogue)return Dialogue(dialogue);
@@ -88,7 +93,10 @@ internal sealed partial class NativeWorkExecutor
             if(_index<requests.Length){
                 var r=requests[_index];var item=Item(r.GetProperty("itemId").GetString()!,r.GetProperty("quality").GetInt32());
                 if(item==null)return End("quest_delivery_item_missing");
-                Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);npc.tryToReceiveActiveObject(Game1.player);_index++;return "running";
+                if(item.QualifiedItemId!=delivery.ItemId.Value||r.GetProperty("count").GetInt32()<delivery.number.Value||item.modData.ContainsKey("StardewCompanion/Protected"))return End("quest_delivery_contract_mismatch");
+                var before=Count(item.QualifiedItemId);Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);
+                if(!npc.tryToReceiveActiveObject(Game1.player)||before-Count(item.QualifiedItemId)!=delivery.number.Value)return End("quest_delivery_consumption_not_verified");
+                _index++;return "running";
             }
             if(quest.completed.Value){Completed=1;return Finish("quest_delivery_verified");}return End("quest_delivery_conditions_not_satisfied");
         }
@@ -104,9 +112,17 @@ internal sealed partial class NativeWorkExecutor
         for(var i=0;i<pages.Count;i++){
             if(pages[i] is not System.Collections.IEnumerable entries)continue;
             var index=0;foreach(var entry in entries){
-                if(ReferenceEquals(entry,quest)){Set(menu,"currentPage",i);Call(menu,"ShowQuest",index);var button=Read(menu,Text("operation")=="claim"?"rewardBox":"cancelQuestButton") as ClickableComponent;
+                if(ReferenceEquals(entry,quest)){Set(menu,"currentPage",i);var row=menu.questLogButtons[index].bounds.Center;menu.receiveLeftClick(row.X,row.Y);
+                    if(!ReferenceEquals(Read(menu,"_shownQuest"),quest))return End("quest_journal_selection_not_verified");
+                    if(Text("operation")=="cancel"&&!quest.CanBeCancelled())return End("quest_cannot_be_cancelled");
+                    if(Text("operation")=="claim"&&!quest.HasMoneyReward())return End("quest_has_no_money_reward");
+                    var reward=quest.GetMoneyReward();var before=Game1.player.Money;
+                    var button=Read(menu,Text("operation")=="claim"?"rewardBox":"cancelQuestButton") as ClickableComponent;
                     if(button==null)return End("quest_requested_action_not_available");
-                    var point=button.bounds.Center;menu.receiveLeftClick(point.X,point.Y);Completed=1;return Finish("quest_journal_action_submitted");}
+                    var point=button.bounds.Center;menu.receiveLeftClick(point.X,point.Y);
+                    if(Text("operation")=="claim"&&quest.GetMoneyReward()>0)menu.receiveLeftClick(point.X,point.Y+48);
+                    var verified=Text("operation")=="claim"?quest.GetMoneyReward()==0&&Game1.player.Money-before==reward:!Game1.player.questLog.Contains(quest);
+                    if(!verified)return End("quest_journal_action_not_verified");Completed=1;return Finish("quest_journal_action_verified");}
                 index++;
             }
         }

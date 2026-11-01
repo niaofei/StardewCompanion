@@ -73,7 +73,7 @@ public static class DecisionContextCompression
         var node=JsonSerializer.SerializeToNode(result);
         if(name=="save_plan")return Plan(node);
         if(Get(node,"taskId")!=null){
-            if(name is "observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_opening" or "survey_area" or "read_mailbox"){
+            if(name is "observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_area" or "survey_area" or "read_mailbox"){
                 var query=Pick(node,"taskId","status","reason","observationRevision");query["data"]=CompactQuery(Decode(Get(node,"details")));return query;
             }
             return Receipt(node);

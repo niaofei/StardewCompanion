@@ -12,19 +12,26 @@ public sealed class ModelClient(HttpClient http)
 {
     public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null)
     {
-        using var request=new HttpRequestMessage(HttpMethod.Post,settings.ValidateEndpoint());
-        request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",settings.GetKey());
         var body=new JsonObject { ["model"]=settings.Model,["messages"]=messages.DeepClone(),["tools"]=(toolOverrides??ToolCatalog.Definitions(soloTest,capabilities)).DeepClone(),["tool_choice"]=toolChoice?.DeepClone()??JsonValue.Create("auto"),["stream"]=false,["max_tokens"]=2400 };
         var payload=body.ToJsonString();
         capture?.Invoke(body);
-        request.Content=new StringContent(payload,System.Text.Encoding.UTF8,"application/json");
         var timer=Stopwatch.StartNew();
+        for(var attempt=0;;attempt++){
+        try{
+        using var request=new HttpRequestMessage(HttpMethod.Post,settings.ValidateEndpoint());
+        request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",settings.GetKey());
+        request.Content=new StringContent(payload,System.Text.Encoding.UTF8,"application/json");
         using var response=await http.SendAsync(request,cancellation);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"模型请求失败（HTTP {(int)response.StatusCode}）");
+        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"模型请求失败（HTTP {(int)response.StatusCode}）",null,response.StatusCode);
         var root=JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellation))!;
         var message=root["choices"]?[0]?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
         var calls=message["tool_calls"] as JsonArray??new JsonArray();
         return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable");
+        }
+        catch(HttpRequestException ex)when(attempt<2&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
+            await Task.Delay(TimeSpan.FromSeconds(attempt+1),cancellation);
+        }
+        }
     }
 
     public async Task<ModelReply> TestToolCalling(ModelSettings settings, CancellationToken cancellation)
@@ -50,9 +57,16 @@ public static class ToolCatalog
         Tool("update_season_progress","只追加上一日已验证的游戏进度；不得修改季节计划固定字段",("progress","array","从已提供的成功工具回执中提炼的进度字符串数组")),
         Tool("create_season_plan","在首个季节计划缺失时创建，或季节切换且上一季已核验后创建下一季计划",("season","string","当前观察中的季节名"),("goal","string","本季目标"),("constraints","array","锁定约束字符串数组"),("successCriteria","array","可由游戏状态与回执核验的成功条件字符串数组"),("progress","array","初始化进度字符串数组"),("previousSeasonReview","string","季末基于成功条件、累计进度与真实回执核验上一季的结果；首次创建时说明这是初始计划"))
     };
-    public static readonly HashSet<string> Queries=new(new[]{"observe","inspect_target","inspect_route","inspect_opening","inspect_targets","read_mailbox"});
-    public static readonly HashSet<string> OpeningActions=new(new[]{"collect_starter_seeds","clear_area","till_area","plant_area","craft_chest","place_chest"});
-    public static readonly HashSet<string> Actions=new(new[]{"water_area","harvest_area","refill_water","forage_area","deposit_items","withdraw_items","go_to","go_to_and_collect","follow_player","return_home","sleep","respond_dialogue","fish_at","fight_enemies","mine_travel"});
+    public static readonly HashSet<string> Queries=new(new[]{"observe","inspect_target","inspect_route","inspect_area","inspect_targets","read_mailbox"});
+    public static readonly HashSet<string> Actions=new(new[]{"water_area","harvest_area","refill_water","forage_area","clear_area","till_area","plant_area","deposit_items","withdraw_items","go_to","follow_player","return_home","sleep","respond_dialogue","fish_at","fight_enemies","mine_travel"});
+    public static readonly string[] TopLevelFrequentTools={"go_to","water_area","harvest_area","forage_area","sleep","clear_area","till_area","plant_area","deposit_items","withdraw_items"};
+    public static void ValidateArguments(string name,JsonObject arguments)
+    {
+        var definition=PrimitiveDefinitions().FirstOrDefault(t=>t?["function"]?["name"]?.ToString()==name)?["function"]?["parameters"]
+            ??throw new InvalidOperationException("未注册的工具："+name);
+        using var schema=JsonDocument.Parse(definition.ToJsonString());using var value=JsonDocument.Parse(arguments.ToJsonString());
+        ContractValidation.ValidateSchema(schema.RootElement,value.RootElement,name);
+    }
     private static JsonObject Field(string type,string description)=>type=="array"
         ?new(){["type"]=type,["description"]=description,["items"]=new JsonObject{["type"]="string"}}
         :new(){["type"]=type,["description"]=description};
@@ -71,9 +85,9 @@ public static class ToolCatalog
             Tool("observe","读取当前原生游戏观察"),
             Tool("inspect_target","检查当前地图格子与箱子内容",("x","integer","横坐标"),("y","integer","纵坐标")),
             Tool("inspect_route","检查当前可用的步行连接",("location","string","机器地点标识")),
+            Tool("inspect_area","只读检查当前地图指定区域的地形、障碍和可达性",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")),
             Tool("read_context_history","按需读取当前存档的本地历史；不会操作游戏。plans空id列计划索引，指定id读步骤与回执；memory空id列记忆，指定id读原文；receipts指定任务id分页读处理格与掉落",("source","string","plans、memory、receipts或diagnostics"),("id","string","计划ID、记忆ID或任务ID；查询索引时为空字符串"),("offset","integer","从0开始的分页偏移"),("limit","integer","每页1到8项")),
-            Tool("go_to","正常四方向步行到可达格子；可选破坏自然障碍以缩短路径",("location","string","机器地点标识"),("x","integer","横坐标"),("y","integer","纵坐标")),
-            Tool("go_to_and_collect","沿正常步行路线前往目标，并顺路拾取路径周围明确半径内的可见掉落物；仅收拾当前实际经过地图上的物品",("location","string","目标机器地点标识"),("x","integer","目标地图横坐标"),("y","integer","目标地图纵坐标"),("pickupRadius","integer","距离实际A*路线的半径，单位格，0到8"),("breakNaturalObstacles","boolean","是否允许破坏自然障碍以缩短路线，由模型决定")),
+            Tool("go_to","正常四方向步行到可达格子；collect=true时顺路拾取路径周围可见掉落物，单个掉落物拾取失败不会中断寻路",("location","string","机器地点标识"),("x","integer","横坐标"),("y","integer","纵坐标"),("collect","boolean","是否顺路采集，默认false"),("pickupRadius","integer","采集范围距实际A*路线的格数，0到8，默认2"),("breakNaturalObstacles","boolean","是否允许破坏自然障碍以缩短路径，由模型决定")),
             Tool("respond_dialogue","读取当前弹窗后按明确选项继续；普通提示用空responseKey确认",("responseKey","string","必须是当前弹窗实际提供的responseKey；非选项提示填空字符串")),
             Tool("fish_at","在指定岸边和抛竿方向连续钓鱼；本地控制原版鱼条，结果只按原版鱼获确认",("location","string","已观察的钓鱼地点机器标识"),("x","integer","玩家应站立的岸边格X"),("y","integer","玩家应站立的岸边格Y"),("direction","string","抛竿朝向"),("casts","integer","最多抛竿次数1到20"),("treasurePolicy","string","try或ignore，由模型选择是否争取宝箱")),
             Tool("fight_enemies","在当前普通矿井连续战斗，按原版武器碰撞与怪物状态核验；不自动吃食物或撤退",("maxKills","integer","击杀目标数1到30"),("maxGameMinutes","integer","游戏时间上限1到600"),("weaponId","string","明确使用的武器QualifiedItemId")),
@@ -88,33 +102,43 @@ public static class ToolCatalog
         var goTo=a.First(t=>t?["function"]?["name"]?.GetValue<string>()=="go_to");
         goTo!["function"]!["parameters"]!["properties"]!["breakNaturalObstacles"]=new JsonObject{["type"]="boolean",["description"]="是否允许为缩短路程破坏自然枝条、石块、杂草、野树或草；会消耗工具耐久/体力并掉落物品，由模型决定"};
         foreach(var name in new[]{"water_area","harvest_area","forage_area"})
-            a.Add(Tool(name,"按指定区域连续处理目标，并返回实际执行结果",("location","string","地点标识"),("x","integer","区域左上横坐标"),("y","integer","区域左上纵坐标"),("width","integer","宽1到120"),("height","integer","高1到120")));
+            if(name=="water_area")a.Add(Tool(name,"浇灌指定区域当前仍需浇水的作物；可选择自动前往最近水源补满后继续，已浇水格会跳过",("location","string","地点标识"),("x","integer","区域左上横坐标"),("y","integer","区域左上纵坐标"),("width","integer","宽1到120"),("height","integer","高1到120"),("autoRefill","boolean","水量不足时是否自动前往最近可达水源补满并继续，默认false")));
+            else a.Add(Tool(name,"按指定区域连续处理目标，并返回实际执行结果",("location","string","地点标识"),("x","integer","区域左上横坐标"),("y","integer","区域左上纵坐标"),("width","integer","宽1到120"),("height","integer","高1到120")));
+        foreach(var tool in a)if(tool?["function"]?["name"]?.GetValue<string>()=="water_area"){
+            tool["function"]!["parameters"]!["properties"]!["autoRefill"]!["default"]=false;
+            var required=tool["function"]!["parameters"]!["required"]!.AsArray();required.Remove(required.First(v=>v!.ToString()=="autoRefill"));
+        }
+        a.Add(Tool("clear_area","按类型连续清除指定区域的自然障碍，并按真实状态验收",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32"),("targetType","string","障碍类型")));
+        a.Add(Tool("till_area","将指定区域的可耕空地锄成耕地，不播种",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")));
+        a.Add(Tool("plant_area","在指定区域已有的空耕地播种指定种子",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32"),("seedId","string","背包种子QualifiedItemId")));
         foreach(var name in new[]{"deposit_items","withdraw_items"})
             a.Add(Tool(name,"自动步行到指定的玩家授权工作箱、打开并按堆叠批量存取明确数量；保护物品不能转移",("chest","string","已授权工作箱名称"),("itemId","string","物品机器标识，如 (O)388"),("count","integer","数量1到9999")));
-        if(soloTest)
-        {
-            a.Add(Tool("inspect_opening","仅单人测试：读取可达5x3初始农田建议、箱子空位和木材目标，不执行操作"));
-            a.Add(Tool("collect_starter_seeds","正常打开家中初始礼包领取15个防风草种子"));
-            foreach(var name in new[]{"clear_area","till_area","plant_area"})
-                a.Add(Tool(name,name=="clear_area"?"按targetType连续清障或砍成熟野树并拾取掉落，不锄地；不处理果树及挂采集器的树":name=="till_area"?"只把可耕空地锄成耕地，不播种；障碍先清除":"只向已有空耕地播种防风草，不清障不锄地",("location","string","必须Farm"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")));
-            a.Add(Tool("craft_chest","背包有50木材时按原生配方制作一个箱子"));
-            a.Add(Tool("place_chest","用背包已有箱子原生放置在Farm空地",("x","integer","横坐标"),("y","integer","纵坐标")));
-            a.Add(Tool("authorize_test_chest","将自制工作箱绑定为开荒箱，提供普通资源及春季采集物存取",("x","integer","横坐标"),("y","integer","纵坐标")));
+        foreach(var tool in a)if(tool?["function"]?["name"]?.GetValue<string>() is "clear_area" or "till_area" or "plant_area"){
+            tool["function"]!["parameters"]!["properties"]!["width"]!["maximum"]=32;
+            tool["function"]!["parameters"]!["properties"]!["height"]!["maximum"]=32;
         }
         foreach(var tool in a)
             if(tool?["function"]?["name"]?.GetValue<string>()=="clear_area"){
                 tool["function"]!["parameters"]!["properties"]!["targetType"]=new JsonObject{["type"]="string",["enum"]=new JsonArray("all","debris","twig","stone","weeds","grass","tree","stump"),["description"]="tree砍成熟野树并拾取木材；twig只处理地面枝条；stump处理小树桩；debris清石枝草但保留树；all也包含野树"};
                 tool["function"]!["parameters"]!["properties"]!["removeStumps"]=new JsonObject{["type"]="boolean",["description"]="砍树后是否继续处理树桩；省略时处理，false保留树桩"};
-                tool["function"]!["parameters"]!["required"]!.AsArray().Add("targetType");
-            }
-        foreach(var tool in a)
-            if(tool?["function"]?["name"]?.GetValue<string>()=="plant_area"){
-                tool["function"]!["parameters"]!["properties"]!["seedId"]=new JsonObject{["type"]="string",["enum"]=new JsonArray("(O)472"),["description"]="明确选择初始防风草种子"};
-                tool["function"]!["parameters"]!["required"]!.AsArray().Add("seedId");
             }
         foreach(var c in BusinessCapabilities.All){
             a.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]=c.Name,["description"]=c.Description,
                 ["parameters"]=new JsonObject{["type"]="object",["properties"]=JsonNode.Parse(c.PropertiesJson),["required"]=new JsonArray(c.Required.Select(k=>(JsonNode?)JsonValue.Create(k)).ToArray()),["additionalProperties"]=false}}});
+        }
+        foreach(var tool in a){var f=tool!["function"]!;var props=f["parameters"]!["properties"]!.AsObject();var name=f["name"]!.ToString();
+            foreach(var coordinate in new[]{"x","y"})if(props[coordinate]!=null)props[coordinate]!["minimum"]=0;
+            if(name.EndsWith("_area"))foreach(var dimension in new[]{"width","height"}){props[dimension]!["minimum"]=1;props[dimension]!["maximum"]=32;props[dimension]!["description"]="区域尺寸1到32格";}
+            if(name=="go_to"){
+                var required=f["parameters"]!["required"]!.AsArray();foreach(var key in new[]{"collect","pickupRadius","breakNaturalObstacles"})required.Remove(required.First(v=>v!.ToString()==key));
+                props["collect"]!["default"]=false;props["pickupRadius"]!["default"]=2;props["pickupRadius"]!["minimum"]=0;props["pickupRadius"]!["maximum"]=8;props["breakNaturalObstacles"]!["default"]=false;
+            }
+            if(name=="fish_at"){
+                props["casts"]!["minimum"]=1;props["casts"]!["maximum"]=20;
+                props["direction"]!["enum"]=new JsonArray("up","right","down","left");props["treasurePolicy"]!["enum"]=new JsonArray("try","ignore");
+            }
+            if(name=="fight_enemies"){props["maxKills"]!["minimum"]=1;props["maxKills"]!["maximum"]=30;props["maxGameMinutes"]!["minimum"]=1;props["maxGameMinutes"]!["maximum"]=600;}
+            if(name=="read_context_history"){props["source"]!["enum"]=new JsonArray("plans","memory","receipts","diagnostics");props["offset"]!["minimum"]=0;props["limit"]!["minimum"]=1;props["limit"]!["maximum"]=8;}
         }
         return a;
     }
@@ -124,37 +148,40 @@ public static class ToolCatalog
         var planningProperties=new JsonObject{["planId"]=Field("string","unique planning id"),["goal"]=Field("string","public subgoal"),["basis"]=Field("string","observed facts and public rationale")};
         foreach(var field in new[]{"assumptions","successCriteria","pending"})planningProperties[field]=new JsonObject{["type"]="array",["items"]=new JsonObject{["type"]="string"}};
         primitives.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="save_plan",["description"]="更新持续工作目标、依据和下一步；已完成成果由Core依据执行回执维护",["parameters"]=new JsonObject{["type"]="object",["properties"]=planningProperties,["required"]=new JsonArray("planId","goal","basis","assumptions","successCriteria","pending"),["additionalProperties"]=false}}});
-        var tools=new JsonArray();var variants=new JsonArray();
+        var tools=new JsonArray();var grouped=BusinessCapabilities.Groups.ToDictionary(g=>g,_=>new JsonArray());
         foreach(var t in primitives){
             var f=t!["function"]!;var name=f["name"]!.GetValue<string>();
             if(name=="mine_travel")continue;
             if(BusinessCapabilities.Find(name) is {} business){
-                if(name!="mine_travel"){if(business.Query)tools.Add(t.DeepClone());else variants.Add(new JsonObject{["type"]="object",["properties"]=new JsonObject{["skill"]=new JsonObject{["type"]="string",["enum"]=new JsonArray(name)},["arguments"]=f["parameters"]!.DeepClone()},["required"]=new JsonArray("skill","arguments"),["additionalProperties"]=false});}
+                var status=capabilities?.FirstOrDefault(c=>c.Name==name);
+                var alwaysExpose=name is "craft_items" or "craft_and_place";
+                var exposed=capabilities==null||alwaysExpose||status?.Validated==true||status?.State is "supported" or "available_unverified";
+                if(name!="mine_travel"&&exposed){if(business.Query)tools.Add(t.DeepClone());else AddVariant(grouped[business.Group],name,f["parameters"]!);}
                 continue;
             }
-            if(Actions.Contains(name)||OpeningActions.Contains(name)||name=="authorize_test_chest"){
-                variants.Add(new JsonObject{["type"]="object",["properties"]=new JsonObject{
-                    ["skill"]=new JsonObject{["type"]="string",["enum"]=new JsonArray(name)},
-                    ["arguments"]=f["parameters"]!.DeepClone()},["required"]=new JsonArray("skill","arguments"),["additionalProperties"]=false});
+            if(Actions.Contains(name)){
+                AddVariant(grouped[BusinessCapabilities.GroupFor(name)],name,f["parameters"]!);
+                if(TopLevelFrequentTools.Contains(name))tools.Add(t.DeepClone());
             }else tools.Add(t.DeepClone());
         }
-        tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{
-            ["name"]="execute_plan",["description"]="提交1到8个有序操作，本地连续执行核验，失败停止余下步骤；sleep必须最后",
-            ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{
-                ["planId"]=Field("string","本次计划唯一标识，相同标识不会重复执行"),
-                ["encounterPolicy"]=new JsonObject{["type"]="string",["enum"]=new JsonArray("fight","avoid","interrupt"),["description"]="本批操作遇到普通矿井怪物时的明确策略；省略时默认interrupt"},
-                ["steps"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=8,["items"]=new JsonObject{["oneOf"]=variants}}},
-                ["required"]=new JsonArray("planId","steps"),["additionalProperties"]=false}}});
-        var planTool=tools.Last()!["function"]!["parameters"]!["properties"]!.AsObject();
-        foreach(var field in new[]{"goal","basis"})planTool[field]=Field("string",field);
-        foreach(var field in new[]{"assumptions","successCriteria","pending"})planTool[field]=new JsonObject{["type"]="array",["items"]=new JsonObject{["type"]="string"}};
-        planTool["goal"]!["description"]="本批服务的持续工作目标";
-        planTool["pending"]!["description"]="本批之后接下来要做的工作，列0到8项";
-        planTool["pending"]!["maxItems"]=8;
+        foreach(var group in BusinessCapabilities.Groups){var variants=grouped[group];if(variants.Count==0)continue;var title=BusinessCapabilities.GroupTitle(group);
+            tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{
+                ["name"]="group_"+group,["description"]=title+"：在本组选择1到8个按序执行的子技能；失败时停止后续步骤",
+                ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{
+                    ["planId"]=Field("string","本次计划唯一标识，相同标识不会重复执行"),
+                    ["encounterPolicy"]=new JsonObject{["type"]="string",["enum"]=new JsonArray("fight","avoid","interrupt"),["description"]="遇到普通矿井怪物时的策略；省略时默认interrupt"},
+                    ["steps"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=8,["items"]=new JsonObject{["oneOf"]=variants}}},
+                    ["required"]=new JsonArray("planId","steps"),["additionalProperties"]=false}}});
+            var parameters=tools.Last()!["function"]!["parameters"]!["properties"]!.AsObject();
+            foreach(var field in new[]{"goal","basis","assumptions","successCriteria","pending"})parameters[field]=planningProperties[field]!.DeepClone();
+            parameters["pending"]!["maxItems"]=8;
+        }
         tools.Add(Tool("wait_for_change","没有有效工作时等待状态变化或到期",("seconds","integer","1到120秒"),("reason","string","明确等待什么条件")));
         tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="inspect_targets",["description"]="一次检查当前地图1到32格，避免逐格模型往返",
             ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["tiles"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=32,["items"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["x"]=Field("integer","tile coordinate"),["y"]=Field("integer","tile coordinate")},["required"]=new JsonArray("x","y"),["additionalProperties"]=false}}},["required"]=new JsonArray("tiles"),["additionalProperties"]=false}}});
         return tools;
     }
+    private static void AddVariant(JsonArray variants,string name,JsonNode schema)=>variants.Add(new JsonObject{["type"]="object",["properties"]=new JsonObject{
+        ["skill"]=new JsonObject{["type"]="string",["enum"]=new JsonArray(name)},["arguments"]=schema.DeepClone()},["required"]=new JsonArray("skill","arguments"),["additionalProperties"]=false});
 
 }

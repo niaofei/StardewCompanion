@@ -46,6 +46,8 @@ internal sealed partial class NativeWorkExecutor
     internal string Tick(AiInputSimulator input)
     {
         if(_disposed)return End("native_operation_cancelled");
+        if(_action!="recover"&&Environment.TickCount64-_started>120000)return End("native_action_timeout:"+_action);
+        if(_action=="approach"){var state=Near(Map,Tile,input);return state=="reached"?Finish("target_approached"):state is "blocked" or "unsupported"?End("target_unreachable"):"running";}
         if(_action=="craft")return Craft();
         if(_action=="prepare_recipe")return PrepareRecipe();
         if(_action=="recover")return Recover(input);
@@ -67,7 +69,13 @@ internal sealed partial class NativeWorkExecutor
         var known=Flag("cooking")?Game1.player.cookingRecipes:Game1.player.craftingRecipes;
         if(!known.ContainsKey(recipe))return End("recipe_not_unlocked:"+recipe);
         var definition=new CraftingRecipe(recipe,Flag("cooking"));
-        if(!definition.doesFarmerHaveIngredientsInInventory())return End("recipe_materials_missing:"+recipe);
+        foreach(var ingredient in definition.recipeList){
+            var candidates=Game1.player.Items.Where(i=>CraftingRecipe.ItemMatchesForCrafting(i,ingredient.Key)).ToArray();
+            if(candidates.Any(i=>i.modData.ContainsKey("StardewCompanion/Protected")))return End("protected_recipe_ingredient:"+ingredient.Key);
+            if(Flag("cooking")&&candidates.Any(i=>i.Quality!=Num("ingredientQuality")))return End("ingredient_quality_requires_loadout:"+ingredient.Key);
+            if(candidates.Sum(i=>i.Stack)<ingredient.Value*Num("count",1))return End("recipe_materials_missing:"+ingredient.Key);
+        }
+        if(Flag("cooking")&&Count("(O)917")>0)return End("automatic_seasoning_requires_separate_loadout");
         return Finish("recipe_and_inventory_verified");
     }
     private string Craft()
@@ -106,12 +114,14 @@ internal sealed partial class NativeWorkExecutor
             var body=Body;var location=body.GetProperty("location").GetString()!;
             var cells=Enumerable.Range(body.GetProperty("x").GetInt32(),body.GetProperty("width").GetInt32())
                 .SelectMany(x=>Enumerable.Range(body.GetProperty("y").GetInt32(),body.GetProperty("height").GetInt32()).Select(y=>new GridPoint(x,y)));
-            if(_target==null)_target=cells.Where(p=>!_done.Contains(p)).FirstOrDefault(p=>{
+            if(Game1.currentLocation.NameOrUniqueName!=location){var travel=Near(location,new(body.GetProperty("x").GetInt32(),body.GetProperty("y").GetInt32()),input);return travel is "blocked" or "unsupported"?End("plot_unreachable"):"running";}
+            if(_target==null)_target=cells.Where(p=>!_done.Contains(p)).Where(p=>{
                 if(!Game1.currentLocation.terrainFeatures.TryGetValue(new(p.X,p.Y),out var f)||f is not HoeDirt d)return false;
-                return _action=="remove_dead"?d.crop?.dead.Value==true:d.fertilizer.Value!=Text("itemId");});
-            if(_target is not {} target||target.Equals(default(GridPoint))&&!cells.Contains(target))return Finish("region_native_operations_finished");
+                return _action=="remove_dead"?d.crop?.dead.Value==true:d.crop==null&&string.IsNullOrEmpty(d.fertilizer.Value);}).Select(p=>(GridPoint?)p).FirstOrDefault();
+            if(_target is not {} target)return Finish("region_native_operations_finished");
             var move=Near(location,target,input);if(move=="blocked"||move=="unsupported")return End("target_unreachable");if(move!="reached")return "running";
             if(_action=="remove_dead"){
+                if(Game1.currentLocation.terrainFeatures.Pairs.Any(p=>Math.Abs(p.Key.X-target.X)<=3&&Math.Abs(p.Key.Y-target.Y)<=3&&p.Value is HoeDirt {crop:not null} soil&&!soil.crop.dead.Value))return End("live_crop_protected_from_scythe_area");
                 if(_wait==0){var tool=Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(w=>w.isScythe());if(tool==null)return End("scythe_missing");Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);Face(target);input.Tool=true;_wait=Environment.TickCount64+800;return "running";}
                 if(Environment.TickCount64<_wait)return "running";
                 if(Game1.currentLocation.terrainFeatures.TryGetValue(new(target.X,target.Y),out var terrain)&&terrain is HoeDirt {crop:not null})return End("dead_crop_clear_not_verified");
@@ -120,36 +130,21 @@ internal sealed partial class NativeWorkExecutor
         }
         if(_action=="place"||_action=="plant_tree"){
             var move=Near(Map,Tile,input);if(move is "blocked" or "unsupported")return End("placement_unreachable");if(move!="reached")return "running";
-            var id=Text("itemId");if(Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var existing)&&existing.QualifiedItemId==id){Completed=0;return Finish("already_placed");}
+            var id=Text("itemId");
+            if(_action=="plant_tree"&&(ItemRegistry.Create(id) is not StardewValley.Object seedling||!seedling.IsWildTreeSapling()&&!seedling.IsFruitTreeSapling()))return End("tree_seed_or_sapling_required");
+            if(_action=="plant_tree"&&IsFruitTreeSapling(id)&&FruitTree.IsGrowthBlocked(new(Tile.X,Tile.Y),Game1.currentLocation))return End("fruit_tree_growth_space_blocked");
+            if(Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var existing)&&existing.QualifiedItemId==id){Completed=0;return Finish("already_placed");}
             if(!PlaceItem(id,Tile))return End("native_placement_rejected");
+            Completed=1;
             if(Body.TryGetProperty("attachmentId",out var attachment)&&attachment.ValueKind!=JsonValueKind.Null){
                 var item=Item(attachment.GetString()!);if(item==null)return End("attachment_missing");
-                Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);_interact(Tile);
+                var before=Count(item.QualifiedItemId);Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);_interact(Tile);
+                if(Count(item.QualifiedItemId)!=before-1)return End("attachment_consumption_not_verified");
             }
+            if(_action=="plant_tree")_results.Add(new{season=Game1.currentSeason,fruitTree=IsFruitTreeSapling(id),growth=IsFruitTreeSapling(id)?"grows_in_all_seasons_fruit_depends_on_tree_season":Game1.currentSeason=="winter"?"wild_tree_winter_growth_requires_native_exception":"native_growth_rules"});
             Completed=1;return Finish(_action=="plant_tree"?"native_tree_planted":"native_item_placed");
         }
-        if(_action=="machine"){
-            var move=Near(Map,Tile,input);if(move is "blocked" or "unsupported")return End("machine_unreachable");if(move!="reached")return "running";
-            if(!Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var obj))return End("machine_missing");
-            if(_wait!=0){
-                if(Environment.TickCount64<_wait)return "running";
-                var running=obj.MinutesUntilReady>0||obj.heldObject.Value!=null&&!obj.readyForHarvest.Value;
-                if(Text("mode")!="collect"&&!running)return End("machine_input_not_verified");
-                Completed++;return Finish(running?"processing":"output_collected");
-            }
-            var mode=Text("mode");
-            if(mode is "collect" or "collect_and_load"){
-                if(obj.readyForHarvest.Value){Game1.player.CurrentToolIndex=EmptyHand();_interact(Tile);_wait=Environment.TickCount64+500;if(mode=="collect")return "running";_wait=0;}
-                else if(mode=="collect")return Finish("machine_not_ready");
-            }
-            if(mode is "load" or "collect_and_load"){
-                var id=Body.GetProperty("inputId").GetString();if(id==null)return End("machine_input_unspecified");
-                var item=Item(id,Body.GetProperty("quality").GetInt32());if(item==null)return End("machine_input_missing");
-                if(obj.heldObject.Value!=null)return Finish("already_processing");
-                Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);_interact(Tile);
-            }
-            _wait=Environment.TickCount64+600;return "running";
-        }
+        if(_action=="machine")return ServiceMachine(input);
         return FarmingExtras(input);
     }
     private bool PlaceItem(string id,GridPoint tile)
@@ -158,17 +153,22 @@ internal sealed partial class NativeWorkExecutor
         var before=Count(id);Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);
         return Utility.tryToPlaceItem(Game1.currentLocation,item,tile.X*64,tile.Y*64)&&Count(id)==before-1;
     }
+    private static bool IsFruitTreeSapling(string id)=>Game1.fruitTreeData.ContainsKey(ItemRegistry.GetDataOrErrorItem(id).ItemId);
     private static void Face(GridPoint target){var p=Navigation.Current;Game1.player.faceDirection(target.X>p.X?1:target.X<p.X?3:target.Y>p.Y?2:0);}
     private static int EmptyHand(){var empty=Game1.player.Items.IndexOf(null);return empty>=0?empty:Game1.player.Items.ToList().FindIndex(i=>i is Tool);}
     private string Recover(AiInputSimulator input)
     {
         var targetStamina=_args.GetProperty("targetStamina").GetSingle();var targetHealth=Num("targetHealth");
+        if(targetStamina>Game1.player.MaxStamina||targetHealth>Game1.player.maxHealth)return End("recovery_target_exceeds_character_maximum");
         if(Game1.player.Stamina>=targetStamina&&Game1.player.health>=targetHealth)return Finish("requested_recovery_reached");
+        var minutes=Game1.timeOfDay/100*60+Game1.timeOfDay%100;if(_recoveryStartMinutes<0)_recoveryStartMinutes=minutes;
+        if(minutes-_recoveryStartMinutes>=Num("maxGameMinutes"))return End("recovery_requested_wait_limit");
         if(_wait!=0&&Environment.TickCount64<_wait)return "running";
         if(Text("method")=="food"){
             if(Game1.player.isEating||!Game1.player.CanMove)return "running";
             if(Completed>=Num("maxItems"))return End("recovery_item_limit_reached");
             var food=Item(Text("itemId"),Num("quality")) as StardewValley.Object;if(food==null)return End("requested_food_missing");
+            if(food.edibility.Value<=0||food.modData.ContainsKey("StardewCompanion/Protected"))return End("requested_food_not_restorative_or_protected");
             Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(food);
             Game1.player.eatObject(food);
             if(!Game1.player.isEating)return End("native_food_consumption_rejected");

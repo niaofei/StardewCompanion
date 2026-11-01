@@ -31,7 +31,7 @@ public sealed partial class CompanionRuntime
         var s=_bridge.Observation!;
         if(Mode=="plan_only"){SaveWorkPlan(args,args["steps"],false);return new{status="saved_plan_only",executed=false};}
         if(!_resumed||_planTask is {IsCompleted:false}||s.ActiveTaskId!="")throw new InvalidOperationException("当前忙碌或已暂停，不能提交新计划");
-        var plan=ShortPlan.Parse(args,s.ControlMode=="solo_test"&&ControlModePolicy.CanControl(s));
+        var plan=ShortPlan.Parse(args);
         if(s.Menu=="DialogueBox"&&plan.Steps[0].Skill!="respond_dialogue")
             throw new InvalidOperationException("当前有未处理的对话弹窗；计划第一步必须按menuContext中的responseKey调用respond_dialogue");
         SaveWorkPlan(args,args["steps"],false);
@@ -65,13 +65,6 @@ public sealed partial class CompanionRuntime
                 var facts=FactFingerprint(state);
                 if(signature==_lastActionFingerprint&&facts==_lastActionState&&_unchangedFailures>0)
                     throw new InvalidOperationException("unchanged_target_previously_failed:"+_lastFailureReason+":目标及相关状态未变化，先解决阻塞或选择其他工作");
-                if(step.Skill=="authorize_test_chest")
-                {
-                    if(state.ControlMode!="solo_test"||state.Location!="Farm")throw new InvalidOperationException("test_chest_requires_solo_farm");
-                    await BindChest("开荒箱",step.Arguments["x"]!.GetValue<int>(),step.Arguments["y"]!.GetValue<int>(),
-                        new[]{"(O)24","(O)16","(O)18","(O)20","(O)22","(O)388","(O)390","(O)771","(O)92","(O)309","(O)310","(O)311","(O)770","(O)382","(O)330"},Array.Empty<string>(),ct);
-                    results.Add(new{step=i,skill=step.Skill,status="completed",reason="test_chest_bound"});continue;
-                }
                 var authorized=PermissionPolicy.Authorize(step.Skill,step.Arguments,_memory.Chests(scope),state);
                 var taskId=Guid.NewGuid().ToString("N");_taskDecisions[taskId]=decision;
                 Trace("permission_allowed",new{name=step.Skill,arguments=authorized,planId=plan.Id,step=i},decision);

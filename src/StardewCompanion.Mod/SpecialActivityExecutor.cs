@@ -57,9 +57,9 @@ internal sealed class SpecialActivityExecutor
     internal void ProgressSent() => _lastProgress = Environment.TickCount64;
     internal static CapabilityStatus[] Capabilities() => new[]
     {
-        new CapabilityStatus{Name="fish_at",Group="fishing",State="supported",Implemented=true,Reason=""},
-        new CapabilityStatus{Name="fight_enemies",Group="combat",State="supported",Implemented=true,Reason=""},
-        new CapabilityStatus{Name="mine_travel",Group="mine_travel",State="disabled",Implemented=true,Reason="mines_disabled"}
+        new CapabilityStatus{Name="fish_at",Group="resources_exploration",State="available_unverified",Implemented=true,Reason="requires_gameplay_validation"},
+        new CapabilityStatus{Name="fight_enemies",Group="resources_exploration",State="available_unverified",Implemented=true,Reason="requires_gameplay_validation"},
+        new CapabilityStatus{Name="mine_travel",Group="navigation_movement",State="disabled",Implemented=true,Reason="mines_disabled"}
     };
 
     internal SpecialActivityExecutor(string skill, string arguments, Action<GridPoint> interact)

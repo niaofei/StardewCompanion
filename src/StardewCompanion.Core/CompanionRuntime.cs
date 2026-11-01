@@ -165,7 +165,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         }
         catch(Exception ex){Trace("control_error",new{action="interrupt_for_player_message",error=SafeError(ex)});}
     }
-    public void ClearQuestion(){PendingQuestion="";if(_scope!="")_memory.Set(_scope,"pendingQuestion","");Changed?.Invoke();}
+    public void ClearQuestion(){PendingQuestion="";if(_scope!="")_memory.Set(_scope,"pendingQuestion","");Invalidate(false);WakeDecision();Changed?.Invoke();}
     public void AddMemory(string kind,string text)
     {if(_scope=="")throw new InvalidOperationException("尚未连接角色");if(kind=="project")_memory.CreateProject(_scope,text,_day);else _memory.Add(_scope,kind,text,"player",_day,kind=="agreement"?"player_stated":"needs_recheck");Changed?.Invoke();}
     public void EditMemory(long id,string text)
@@ -183,7 +183,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         var binding=new ChestBinding(name,v["id"]!.GetValue<string>(),v["location"]!.GetValue<string>(),x,y,allowed,protectedIds);
         foreach(var old in _memory.Chests(_scope).Where(c=>c.Name==name))
             foreach(var m in _memory.List(_scope).Where(m=>m.Kind=="place"&&m.Text.Contains(old.Id)))_memory.Delete(_scope,m.Id);
-        _memory.Add(_scope,"place",JsonSerializer.Serialize(binding),"player",_day,"player_stated");Changed?.Invoke();
+        _memory.Add(_scope,"place",JsonSerializer.Serialize(binding),"player",_day,"player_stated");
+        if(PendingQuestion.Contains("箱")||PendingQuestion.Contains("chest",StringComparison.OrdinalIgnoreCase)){
+            PendingQuestion="";_memory.Set(_scope,"pendingQuestion","");
+        }
+        Invalidate(false);WakeDecision();Changed?.Invoke();
     }
     private async Task Run()
     {
@@ -251,7 +255,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                     messages[1]!["content"]=DecisionContextCompression.Serialize(context);
                 }
                 var requestId=Guid.NewGuid().ToString("N");
-                var reply=await _model.Complete(Settings,messages,cancellation,soloTest:state.ControlMode=="solo_test"&&ControlModePolicy.CanControl(state),capabilities:state.Capabilities,
+                var reply=await _model.Complete(Settings,messages,cancellation,soloTest:false,capabilities:state.Capabilities,
                     toolOverrides:promptTools, capture:body=>Trace("model_prompt_capture",new{requestId,round,kind=seasonMaintenance?"sleep_maintenance":"daily_action",gameDay=state.GameDay,
                         prompt=body,feedbackRevision=seasonMaintenance?null:delivery["revision"]?.DeepClone(),eventIds=seasonMaintenance?Array.Empty<string?>():delivery["pendingEvents"]?.AsArray().Select(e=>e?["id"]?.ToString()).ToArray()},decisionId));
                 Log(new{kind="model",elapsedMs=reply.ElapsedMs,usage=reply.Usage});
@@ -296,6 +300,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                     try
                     {
                         if(!promptTools.Any(t=>t?["function"]?["name"]?.ToString()==name))throw new InvalidOperationException("tool_not_in_current_scope:"+name);
+                        using(var schema=JsonDocument.Parse(promptTools.First(t=>t?["function"]?["name"]?.ToString()==name)!["function"]!["parameters"]!.ToJsonString()))
+                        using(var value=JsonDocument.Parse(arguments.ToJsonString()))ContractValidation.ValidateSchema(schema.RootElement,value.RootElement,name);
                         if(name=="save_plan"){
                             result=SaveWorkPlan(arguments);
                             if(Mode=="plan_only"){_decisionDue=Environment.TickCount64+120000;mutation=true;}
@@ -308,13 +314,14 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             result=new{status="expanded",scope=ScopeFor(expanded)};
                         }
                         else if(name=="read_context_history"){result=ReadContextHistory(arguments);}
-                        else if(name=="execute_plan")
+                        else if(name.StartsWith("group_",StringComparison.Ordinal)||name=="execute_plan")
                         {
                             if(mutation)throw new InvalidOperationException("本轮已经提交计划");
                             var allowed=ScopeFor(promptTools)["allowedSkillsThisTurn"]!.AsArray().Select(v=>v!.ToString()).ToHashSet();
                             foreach(var step in arguments["steps"]?.AsArray()??new JsonArray()){
                                 var skill=step?["skill"]?.ToString()??"";ValidateSkillScope(skill,step?["arguments"] as JsonObject);
                                 if(!allowed.Contains(skill))throw new InvalidOperationException("skill_not_in_current_scope:"+skill+":call_list_capabilities_to_expand");
+                                if(name.StartsWith("group_",StringComparison.Ordinal)&&BusinessCapabilities.GroupFor(skill)!=name[6..])throw new InvalidOperationException("skill_outside_parent_group:"+skill);
                             }
                             result=StartPlan(arguments,decisionId);mutation=true;
                         }
@@ -344,17 +351,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             result=new{updated,state="next_step_only"};
                         }
                         else if(name=="cancel_task") {if(Mode=="plan_only")throw new InvalidOperationException("plan_only");await _bridge.Control("cancel");result=new{status="cancel_requested"};}
-                        else if(name=="authorize_test_chest")
-                        {
-                            var latest=_bridge.Observation!;
-                            if(Mode=="plan_only"||!_resumed||mutation||latest.ControlMode!="solo_test"||!latest.IsHost||!ControlModePolicy.CanControl(latest)||latest.Location!="Farm")throw new InvalidOperationException("只能在隔离单人测试农场绑定自己的开荒箱");
-                            await BindChest("开荒箱",arguments["x"]!.GetValue<int>(),arguments["y"]!.GetValue<int>(),new[]{"(O)24","(O)16","(O)18","(O)20","(O)22","(O)388","(O)390","(O)771","(O)92","(O)309","(O)310","(O)311","(O)770","(O)382","(O)330"},Array.Empty<string>());
-                            result=new{status="bound",name="开荒箱"};mutation=true;
-                        }
-                        else if(ToolCatalog.Actions.Contains(name)||ToolCatalog.OpeningActions.Contains(name))
+                        else if(ToolCatalog.Actions.Contains(name)||BusinessCapabilities.Find(name) is {Query:false})
                         {
                             if(Mode=="plan_only"||!_resumed)throw new InvalidOperationException("Agent 已暂停，不派发动作");
                             if(mutation)throw new InvalidOperationException("本轮已派发一项任务；其余动作未执行，请等实际回执后逐项选择");
+                            ValidateSkillScope(name,arguments);
                             var latest=_bridge.Observation!;
                             var authorized=PermissionPolicy.Authorize(name,arguments,_memory.Chests(scope),latest);
                             Trace("permission_allowed",new{name,arguments=authorized},decisionId);
@@ -391,7 +392,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
             }
         }
         catch(OperationCanceledException){Trace("decision_cancelled",new{reason=epoch==Interlocked.Read(ref _epoch)?"timeout":"context_changed"},decisionId);if(epoch==Interlocked.Read(ref _epoch)){Status="模型请求超时；当前本地任务继续";_retryAfter=Environment.TickCount64+60000;Changed?.Invoke();}}
-        catch(Exception ex){Status="模型不可用："+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
+        catch(Exception ex){Status="模型暂不可用，60秒后自动重试："+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
         finally{if(_planTask is not {IsCompleted:false}&&Environment.TickCount64>=_decisionDue)_decisionDue=Environment.TickCount64+1000;Trace("decision_finished",new{},decisionId);_request?.Dispose();_request=null;}
     }
     private void Say(string text){_memory.Chat(_scope,"assistant",text);ChatReceived?.Invoke("AI",text);}

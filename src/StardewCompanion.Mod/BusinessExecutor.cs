@@ -3,6 +3,7 @@ using Microsoft.Xna.Framework;
 using StardewCompanion.Protocol;
 using StardewValley;
 using StardewValley.TerrainFeatures;
+using StardewValley.Objects;
 
 namespace StardewCompanion.Mod;
 
@@ -16,6 +17,7 @@ internal sealed partial class BusinessExecutor
     private WorkUnit? _unit;
     private RoutineExecutor? _child;
     private NativeWorkExecutor? _native;
+    private string? _finishedStatus;
     private int _childCount;
     private readonly Dictionary<string,int> _initial=Inventory();
     internal readonly List<object> Stages=new();
@@ -46,17 +48,21 @@ internal sealed partial class BusinessExecutor
             if(_unit.Skill.StartsWith("$"))_native=new(_unit.Skill[1..],JsonSerializer.Serialize(_unit.Arguments),_interact);
             else _child=new(_unit.Skill,JsonSerializer.Serialize(_unit.Arguments),_interact);
         }
-        var status=_native?.Tick(input)??_child!.Tick(input);
+        var status=_finishedStatus??(_native?.Tick(input)??_child!.Tick(input));
         Phase=_unit.Skill+":"+(_native?.Phase??_child!.Phase);
         if(status=="running")return status;
+        if(_finishedStatus==null){
         _childCount=_native?.Completed??_child!.Completed;
-        var reason=_native?.Reason??_child!.Reason;
-        Stages.Add(new{skill=_unit.Skill,status,reason,completed=_childCount,details=_native?.Details??_child?.BusinessDetails});
+        var recordedReason=_native?.Reason??_child!.Reason;
+        Stages.Add(new{skill=_unit.Skill,status,reason=recordedReason,completed=_childCount,details=_native?.Details??_child?.BusinessDetails});
         if(_child!=null)_tiles.AddRange(_child.AffectedTiles);
         Completed+=_childCount;
+        _finishedStatus=status;
+        }
+        var reason=_native?.Reason??_child!.Reason;
         var optional=_unit.Optional;
-        if(_native?.Cleanup()==false||_child?.Cleanup()==false){Reason="native_menu_cleanup_pending";return "failed";}
-        _child=null;_native=null;var done=_unit;_unit=null;
+        if(_native?.Cleanup()==false||_child?.Cleanup()==false){Phase="native_menu_cleanup_pending";return "running";}
+        _child=null;_native=null;var done=_unit;_unit=null;_finishedStatus=null;
         if(status!="completed"){
             if(optional){Skipped.Add(new{skill=done.Skill,reason});return "running";}
             Reason=reason;return Completed>0?"partial":"failed";
@@ -95,7 +101,7 @@ internal sealed partial class BusinessExecutor
                 if(Text("method")=="sleep")yield return new("sleep",new{});
                 else yield return Native("recover",_args);break;
             case "end_day":
-                if(_args.GetProperty("storageRules").GetArrayLength()>0)yield return new("organize_storage",new{rules=_args.GetProperty("storageRules")});
+                if(_args.GetProperty("storageRules").GetArrayLength()>0)yield return new("organize_storage",new{rules=_args.GetProperty("storageRules"),_bindings=_args.GetProperty("_bindings")});
                 if(_args.GetProperty("shippingItems").GetArrayLength()>0)yield return new("sell_items",new{channel="shipping",location="Farm",shopId=(string?)null,items=_args.GetProperty("shippingItems")});
                 if(Flag("sleep"))yield return new("sleep",new{});break;
             default:
@@ -108,11 +114,13 @@ internal sealed partial class BusinessExecutor
         var region=Region();var partial=Flag("allowPartial");
         if(_skill=="harvest_and_replant"||Flag("harvest"))yield return new("harvest_area",region,true);
         if(Flag("removeDead"))yield return Native("remove_dead",region,true);
-        var seed=Text("seedId",Text("replantSeedId"));var desired=Num("plantCount",Num("width")*Num("height"));
+        var seed=Text("seedId",Text("replantSeedId"));var desired=Num("plantCount",Num("width")*Num("height"));var needed=0;
         if(seed!=""){
-            if(!Game1.cropData.ContainsKey(ItemRegistry.GetDataOrErrorItem(seed).ItemId))throw new InvalidOperationException("unsupported_crop_seed:"+seed);
+            var seedItem=ItemRegistry.Create(seed) as StardewValley.Object;
+            if(seedItem==null||seedItem.Category!=StardewValley.Object.SeedsCategory||seedItem.IsWildTreeSapling()||seedItem.IsFruitTreeSapling())throw new InvalidOperationException("unsupported_crop_seed:"+seed);
+            if(Game1.cropData.TryGetValue(ItemRegistry.GetDataOrErrorItem(seed).ItemId,out var cropData)&&!Game1.currentLocation.SeedsIgnoreSeasonsHere()&&!cropData.Seasons.Contains(Game1.GetSeasonForLocation(Game1.currentLocation)))throw new InvalidOperationException("seed_not_in_current_season:"+seed);
             var occupied=Cells().Count(p=>Game1.currentLocation.terrainFeatures.TryGetValue(new(p.X,p.Y),out var f)&&f is HoeDirt {crop:not null});
-            var needed=Math.Max(0,desired-occupied);
+            needed=Math.Max(0,desired-occupied);
             if(Count(seed)<needed&&!partial)throw new InvalidOperationException($"seed_missing:required={needed};available={Count(seed)}");
         }
         var clear=Text("clearPolicy","none");
@@ -120,10 +128,10 @@ internal sealed partial class BusinessExecutor
             var a=Region();a["targetType"]=clear=="debris_and_wild_trees"?"all":"debris";a["removeStumps"]=true;
             yield return new("clear_area",a,partial);
         }
-        if(seed!=""){
+        if(seed!=""&&needed>0){
             yield return new("till_area",region,partial);
             if(Text("fertilizerId")!="")yield return Native("fertilize",new{region, itemId=Text("fertilizerId")},partial);
-            var a=Region();a["seedId"]=seed;a["maxTargets"]=Math.Min(desired,Count(seed));yield return new("plant_area",a,partial);
+            var a=Region();a["seedId"]=seed;a["maxTargets"]=Math.Min(needed,Count(seed));yield return new("plant_area",a,partial);
         }
         if(Text("waterPolicy")=="water_now")yield return new("water_area",region,partial);
         else Stages.Add(new{skill="water_area",status="skipped_by_policy",reason="skip_today"});
@@ -154,14 +162,49 @@ internal sealed partial class BusinessExecutor
     }
     private IEnumerable<WorkUnit> Produce()
     {
+        var recipeName=Text("recipe");var cooking=_skill=="cook_recipes";
+        var craftCount=Num("count",_args.TryGetProperty("tiles",out var requestedTiles)?requestedTiles.GetArrayLength():_args.TryGetProperty("placements",out var requestedPlacements)?requestedPlacements.GetArrayLength():1);
+        if(recipeName!=""){
+            var known=cooking?Game1.player.cookingRecipes:Game1.player.craftingRecipes;
+            if(!known.ContainsKey(recipeName))throw new InvalidOperationException("recipe_not_unlocked:"+recipeName);
+            var recipe=new CraftingRecipe(recipeName,cooking);
+            if(_skill is "craft_and_place" or "install_irrigation"&&recipe.GetItemData(useFirst:true).QualifiedItemId!=Text("itemId"))throw new InvalidOperationException("recipe_output_item_mismatch");
+            if(_skill is "craft_and_place" or "install_irrigation")craftCount=(craftCount+recipe.numberProducedPerCraft-1)/recipe.numberProducedPerCraft;
+            foreach(var unit in IngredientSources(recipe.recipeList,craftCount,cooking))yield return unit;
+        }
+        if(cooking){var home=Utility.getHomeOfFarmer(Game1.player);var entry=home.getEntryLocation();if(Game1.currentLocation!=home)yield return new("go_to",new{location=home.NameOrUniqueName,x=entry.X,y=entry.Y});}
         var sources=_args.TryGetProperty("sourceChests",out var chests)?chests:_args;
-        yield return Native("prepare_recipe",new{recipe=Text("recipe"),count=Num("count",_args.TryGetProperty("tiles",out var tiles)?tiles.GetArrayLength():1),sourceChests=sources,cooking=_skill=="cook_recipes",ingredientQuality=Num("ingredientQuality")});
-        if(_skill is "craft_items" or "cook_recipes")yield return Native("craft",new{recipe=Text("recipe"),count=Num("count"),cooking=_skill=="cook_recipes",ingredientQuality=Num("ingredientQuality")});
+        yield return Native("prepare_recipe",new{recipe=recipeName,count=craftCount,sourceChests=sources,cooking,ingredientQuality=Num("ingredientQuality")});
+        if(_skill is "craft_items" or "cook_recipes")yield return Native("craft",new{recipe=recipeName,count=craftCount,cooking,ingredientQuality=Num("ingredientQuality")});
         else{
+            if(_skill=="install_irrigation"&&(ItemRegistry.Create(Text("itemId")) is not StardewValley.Object sprinkler||!sprinkler.IsSprinkler()))throw new InvalidOperationException("irrigation_item_must_be_sprinkler");
             var placements=_args.TryGetProperty("tiles",out var t)?t:_args.GetProperty("placements");
-            if(Text("recipe")!="")yield return Native("craft",new{recipe=Text("recipe"),count=placements.GetArrayLength(),cooking=false,ingredientQuality=0});
+            if(recipeName!="")yield return Native("craft",new{recipe=recipeName,count=craftCount,cooking=false,ingredientQuality=0});
             foreach(var tile in placements.EnumerateArray())yield return Native("place",new{location=Map,itemId=Text("itemId"),target=tile},true);
-            if(_skill=="install_irrigation"&&Text("waterPolicy")=="water_now")yield return Native("water_coverage",new{location=Map,placements});
+            if(_skill=="install_irrigation"&&Text("waterPolicy")=="water_now"){
+                var location=Game1.currentLocation;
+                var covered=placements.EnumerateArray().SelectMany(p=>location.objects.TryGetValue(new(p.GetProperty("x").GetInt32(),p.GetProperty("y").GetInt32()),out var sprinkler)?sprinkler.GetSprinklerTiles():new List<Vector2>()).Distinct().ToArray();
+                foreach(var tile in covered)yield return new("water_area",new{location=Map,x=(int)tile.X,y=(int)tile.Y,width=1,height=1,autoRefill=true});
+            }
+        }
+    }
+    private IEnumerable<WorkUnit> IngredientSources(IReadOnlyDictionary<string,int> requirements,int crafts,bool cooking)
+    {
+        if(!_args.TryGetProperty("sourceChests",out var sources))yield break;
+        foreach(var source in sources.EnumerateArray()){
+            if(requirements.All(r=>Game1.player.Items.Where(i=>CraftingRecipe.ItemMatchesForCrafting(i,r.Key)&&(!cooking||i.Quality==Num("ingredientQuality"))).Sum(i=>i.Stack)>=r.Value*crafts))yield break;
+            var name=source.GetString();var binding=_args.GetProperty("_bindings").EnumerateArray().FirstOrDefault(b=>b.GetProperty("Name").GetString()==name);
+            if(binding.ValueKind==JsonValueKind.Undefined)throw new InvalidOperationException("chest_not_authorized:"+name);
+            yield return Native("approach",new{location=binding.GetProperty("Location").GetString(),x=binding.GetProperty("X").GetInt32(),y=binding.GetProperty("Y").GetInt32()});
+            if(!Game1.currentLocation.objects.TryGetValue(new(binding.GetProperty("X").GetInt32(),binding.GetProperty("Y").GetInt32()),out var obj)||obj is not Chest chest||!obj.modData.TryGetValue(WorldView.ChestKey,out var id)||id!=binding.GetProperty("Id").GetString())throw new InvalidOperationException("chest_binding_invalid:"+name);
+            var allowed=binding.GetProperty("AllowedIds").EnumerateArray().Select(v=>v.GetString()).Except(binding.GetProperty("ProtectedIds").EnumerateArray().Select(v=>v.GetString())).ToHashSet();
+            foreach(var ingredient in requirements){
+                var needed=ingredient.Value*crafts-Game1.player.Items.Where(i=>CraftingRecipe.ItemMatchesForCrafting(i,ingredient.Key)&&(!cooking||i.Quality==Num("ingredientQuality"))).Sum(i=>i.Stack);
+                foreach(var item in chest.GetItemsForPlayer(Game1.player.UniqueMultiplayerID).Where(i=>i!=null&&allowed.Contains(i.QualifiedItemId)&&CraftingRecipe.ItemMatchesForCrafting(i,ingredient.Key)&&(!cooking||i.Quality==Num("ingredientQuality"))).ToArray()){
+                    if(needed<=0)break;var amount=Math.Min(needed,item.Stack);
+                    yield return Transfer("withdraw_items",new{chest=name,itemId=item.QualifiedItemId,count=amount,quality=item.Quality});needed-=amount;
+                }
+            }
         }
     }
     private IEnumerable<WorkUnit> Storage()

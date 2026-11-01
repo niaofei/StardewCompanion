@@ -152,44 +152,48 @@ public sealed partial class CompanionRuntime
     }
     private JsonArray DecisionTools(GameObservation state)
     {
-        var all=ToolCatalog.Definitions(state.ControlMode=="solo_test"&&ControlModePolicy.CanControl(state),state.Capabilities);
+        var all=ToolCatalog.Definitions(false,state.Capabilities);
         var w=JsonNode.Parse(state.WorldView) as JsonObject??new();var facts=w["decisionFacts"];
         var work=WorkState();var intent=(work["currentObjective"]?.ToString()??"")+(PlayerGoal["objective"]?.ToString()??"");
-        var skills=new HashSet<string>(new[]{"go_to","return_home","sleep","forage_area","go_to_and_collect"});
+        var skills=new HashSet<string>(new[]{"go_to","return_home","sleep","forage_area"});
         skills.UnionWith(_scopedPlanSkills);
         var farming=state.Location=="Farm"||intent.Contains("种")||intent.Contains("作物")||intent.Contains("开荒")||intent.Contains("farm",StringComparison.OrdinalIgnoreCase);
-        if(farming)skills.UnionWith(new[]{"water_area","harvest_area","refill_water","cultivate_plot","maintain_plot","harvest_and_replant","gather_resource","clear_area","till_area","plant_area","collect_starter_seeds"});
+        if(farming)skills.UnionWith(new[]{"water_area","harvest_area","refill_water","cultivate_plot","maintain_plot","harvest_and_replant","gather_resource","clear_area","till_area","plant_area"});
         if((w["inventoryState"]?["freeSlots"]?.GetValue<int>()??12)<=2||_memory.Chests(_scope).Length>0||intent.Contains("仓")||intent.Contains("箱"))
             skills.UnionWith(new[]{"deposit_items","withdraw_items"});
-        if(_memory.Chests(_scope).Length==0&&farming)skills.UnionWith(new[]{"craft_chest","place_chest","authorize_test_chest"});
+        skills.UnionWith(new[]{"craft_items","craft_and_place"});
         if(state.Menu!="")skills.Add("respond_dialogue");
         if(intent.Contains("钓")||intent.Contains("fish",StringComparison.OrdinalIgnoreCase))skills.Add("fish_at");
         if((w["combat"]?["visibleMonsters"] as JsonArray)?.Count>0||intent.Contains("战斗"))skills.Add("fight_enemies");
         if(state.TimeOfDay>=2200||state.Stamina<40)skills.Add("recover");
-        var queries=new HashSet<string>(new[]{"observe","survey_area","inspect_target","inspect_targets","inspect_route","inspect_opening","execute_plan","ask_user","wait_for_change","list_capabilities","save_plan","read_context_history"});
+        var queries=new HashSet<string>(new[]{"observe","survey_area","inspect_area","inspect_target","inspect_targets","inspect_route","ask_user","wait_for_change","list_capabilities","save_plan","read_context_history"});
         if((w["mailbox"]?["unreadCount"]?.GetValue<int>()??0)>0)queries.Add("read_mailbox");
         var disabled=DisabledSkills();var output=new JsonArray();
         foreach(var tool in all){var clone=tool!.DeepClone();var f=clone["function"]!;var name=f["name"]!.ToString();
             if(MiningSkill(name)||disabled.Contains(name))continue;
-            if(name=="execute_plan"){
+            if(name.StartsWith("group_",StringComparison.Ordinal)){
                 var variants=f["parameters"]!["properties"]!["steps"]!["items"]!["oneOf"]!.AsArray();
                 foreach(var variant in variants.ToArray()){
                     var skill=variant!["properties"]!["skill"]!["enum"]![0]!.ToString();
-                    if(MiningSkill(skill)||disabled.Contains(skill)||(!_expandedTools&&!skills.Contains(skill)))variants.Remove(variant);
+                    if(MiningSkill(skill)||disabled.Contains(skill))variants.Remove(variant);
                 }
                 if(variants.Count==0)continue;
-            }else if(!_expandedTools&&!queries.Contains(name))continue;
+            }else if(!_expandedTools&&!queries.Contains(name)&&!ToolCatalog.TopLevelFrequentTools.Contains(name))continue;
             output.Add(clone);
         }
         return output;
     }
     private static JsonObject ScopeFor(JsonArray tools)
     {
-        var steps=tools.FirstOrDefault(t=>t?["function"]?["name"]?.ToString()=="execute_plan")?["function"]?["parameters"]?["properties"]?["steps"]?["items"]?["oneOf"] as JsonArray??new();
-        return new JsonObject{["allowedSkillsThisTurn"]=new JsonArray(steps.Select(s=>s?["properties"]?["skill"]?["enum"]?[0]?.DeepClone()).ToArray()),
+        var skills=tools.SelectMany(t=>{
+            var name=t?["function"]?["name"]?.ToString()??"";
+            if(name.StartsWith("group_",StringComparison.Ordinal))return (t?["function"]?["parameters"]?["properties"]?["steps"]?["items"]?["oneOf"] as JsonArray??new()).Select(s=>s?["properties"]?["skill"]?["enum"]?[0]?.ToString()??"");
+            return ToolCatalog.Actions.Contains(name)||BusinessCapabilities.Find(name) is {Query:false}?new[]{name}:Array.Empty<string>();
+        }).Where(s=>s!="").Distinct();
+        return new JsonObject{["allowedSkillsThisTurn"]=new JsonArray(skills.Select(s=>(JsonNode?)JsonValue.Create(s)).ToArray()),
             ["availableQueries"]=new JsonArray(tools.Select(t=>t?["function"]?["name"]?.ToString()??"").Where(n=>ToolCatalog.Queries.Contains(n)||BusinessCapabilities.Find(n) is {Query:true}||n is "read_context_history" or "list_capabilities").Select(n=>(JsonNode?)JsonValue.Create(n)).ToArray()),
             ["availableTools"]=new JsonArray(tools.Select(t=>t?["function"]?["name"]?.DeepClone()).ToArray()),
-            ["capabilityAccess"]="除矿洞外的功能已开放；调用list_capabilities展开其他可用技能",["historyAccess"]="read_context_history"};
+            ["capabilityAccess"]="八个类别工具对应不同工作域；调用list_capabilities展开完整技能范围",["historyAccess"]="read_context_history"};
     }
     private JsonObject BuildDecisionInput(GameObservation state,JsonObject delivery,JsonObject conversation,JsonArray tools,string reason)
     {
@@ -245,7 +249,7 @@ public sealed partial class CompanionRuntime
             farm.Remove("chests");farm["cropTiles"]="unknown_from_current_location";farm["source"]="native_farm_summary";
         }
         world["inventoryRelevant"]=w["inventory"]?.DeepClone();
-        foreach(var name in new[]{"soil","forage","looseDrops","naturalObstacles","routes","home","water","npcs","chests"}){
+        foreach(var name in new[]{"soil","forage","looseDrops","naturalObstacles","routes","home","water","npcs","chests","animals","pets","buildings","toolUpgrade","knownRecipes"}){
             if(w[name] is JsonArray list){
                 var limit=name=="soil"?64:24;
                 var ordered=list.OrderBy(v=>Math.Abs((v?["x"]?.GetValue<int>()??state.Tile.X)-state.Tile.X)+Math.Abs((v?["y"]?.GetValue<int>()??state.Tile.Y)-state.Tile.Y)).Take(limit).ToArray();

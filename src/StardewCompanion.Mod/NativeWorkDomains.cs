@@ -18,8 +18,10 @@ internal sealed partial class NativeWorkExecutor
     private int _index;
     private int _moneyBefore;
     private int _quantityBefore;
+    private int _totalPurchaseSpent;
     private IClickableMenu? _ownedMenu;
     private readonly Queue<string> _responses=new();
+    private bool _dialogueResponsesLoaded;
     private static object? Read(object? source,string name)=>source?.GetType().GetField(name,BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(source)
         ??(source==null?null:source.GetType().GetProperty(name,BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(source));
     private static void Set(object source,string name,object? value)
@@ -53,7 +55,7 @@ internal sealed partial class NativeWorkExecutor
     {
         if(Game1.activeClickableMenu is ShopMenu shop){
             if(shop.ShopId!=shopId)return End("unexpected_shop:"+shop.ShopId);
-            _ownedMenu=shop;return "ready";
+            _ownedMenu=shop;return shop.safetyTimer>0?"running":"ready";
         }
         if(Game1.activeClickableMenu is DialogueBox dialogue)
         {
@@ -96,7 +98,7 @@ internal sealed partial class NativeWorkExecutor
         if(!ReferenceEquals(_ownedMenu,dialogue))_results.Add(new{dialogue=dialogue.getCurrentString()});
         _ownedMenu=dialogue;
         if(dialogue.isQuestion){
-            if(_responses.Count==0&&_args.TryGetProperty("dialogueResponses",out var values))foreach(var r in values.EnumerateArray())_responses.Enqueue(r.GetString()!);
+            if(!_dialogueResponsesLoaded&&_args.TryGetProperty("dialogueResponses",out var values)){foreach(var r in values.EnumerateArray())_responses.Enqueue(r.GetString()!);_dialogueResponsesLoaded=true;}
             if(_responses.Count==0)return End("dialogue_choice_required:"+string.Join(",",dialogue.responses.Select(r=>r.responseKey)));
             var response=_responses.Dequeue();var index=Array.FindIndex(dialogue.responses,r=>r.responseKey==response);
             if(index<0)return End("requested_dialogue_option_unavailable:"+response);
@@ -116,18 +118,22 @@ internal sealed partial class NativeWorkExecutor
         if(_action=="purchase_items"){
             var item=menu.forSale.FirstOrDefault(i=>i is Item it&&it.QualifiedItemId==id);
             if(item==null)return End("shop_item_unavailable:"+id);
-            var stock=menu.itemPriceAndStock[item];var spent=Num("maxTotal")-(Game1.player.Money-_moneyBefore);
-            if(stock.Price>request.GetProperty("maxUnitPrice").GetInt32()||stock.Price>Num("maxTotal")-(_moneyBefore-Game1.player.Money)||stock.Price>Game1.player.Money)return End("purchase_budget_exceeded");
+            var stock=menu.itemPriceAndStock[item];
+            if(menu.currency!=0)return End("shop_currency_not_supported_by_gold_contract");
+            if(stock.Price>request.GetProperty("maxUnitPrice").GetInt32()||stock.Price>Num("maxTotal")-_totalPurchaseSpent||stock.Price>Game1.player.Money)return End("purchase_budget_exceeded");
             if(stock.TradeItem!=null)return End("barter_requires_explicit_material_contract");
+            if(item.Stack>wanted-_before)return End("shop_bundle_quantity_exceeds_request");
+            if(((Item)item).IsRecipe&&wanted>1)return End("recipe_purchase_count_must_be_one");
+            if(!Game1.player.couldInventoryAcceptThisItem((Item)item))return End("purchase_inventory_full");
             var n=menu.forSale.IndexOf(item);menu.currentItemIndex=Math.Min(n,Math.Max(0,menu.forSale.Count-4));
             var row=menu.forSaleButtons[n-menu.currentItemIndex].bounds.Center;var before=Count(id);
-            menu.receiveRightClick(row.X,row.Y);
+            var moneyBeforePurchase=Game1.player.Money;var recipesBefore=Game1.player.craftingRecipes.Count()+Game1.player.cookingRecipes.Count();menu.receiveRightClick(row.X,row.Y);_totalPurchaseSpent+=moneyBeforePurchase-Game1.player.Money;
             if(menu.heldItem is Item held){
                 var empty=Game1.player.Items.IndexOf(null);if(empty<0)empty=Game1.player.Items.ToList().FindIndex(i=>i!=null&&i.canStackWith(held)&&i.Stack+held.Stack<=i.maximumStackSize());
                 if(empty<0)return End("purchase_inventory_full");
                 var slot=menu.inventory.inventory[empty].bounds.Center;menu.receiveLeftClick(slot.X,slot.Y);
             }
-            var added=Count(id)-before;if(added<=0)return End("purchase_not_verified");
+            var added=Count(id)-before;if(((Item)item).IsRecipe&&Game1.player.craftingRecipes.Count()+Game1.player.cookingRecipes.Count()>recipesBefore)added=1;if(added<=0)return End("purchase_not_verified");
             _before+=added;Completed+=added;_results.Add(new{itemId=id,added,money=Game1.player.Money});
         }else{
             var quality=request.GetProperty("quality").GetInt32();var owned=Game1.player.Items.Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack);
@@ -162,8 +168,32 @@ internal sealed partial class NativeWorkExecutor
     private bool CleanupDomain()
     {
         if(_ownedMenu!=null&&ReferenceEquals(Game1.activeClickableMenu,_ownedMenu)){
+            if(_ownedMenu is MenuWithInventory inventory&&inventory.heldItem is {} held){
+                if(!Game1.player.addItemToInventoryBool(held))Game1.createItemDebris(held,Game1.player.Position,Game1.player.FacingDirection,Game1.currentLocation);
+                inventory.heldItem=null;
+            }
             if(!_ownedMenu.readyToClose())return false;_ownedMenu.exitThisMenu();
         }
         return true;
+    }
+    private string CollectNativeMenu(ItemGrabMenu menu)
+    {
+        _ownedMenu=menu;
+        var index=menu.ItemsToGrabMenu.actualInventory.ToList().FindIndex(i=>i!=null);
+        if(index<0){menu.exitThisMenu();return "completed";}
+        if(index>=menu.ItemsToGrabMenu.inventory.Count)return End("native_collection_slot_not_visible");
+        var item=menu.ItemsToGrabMenu.actualInventory[index];
+        if(!Game1.player.couldInventoryAcceptThisItem(item))return End("collection_inventory_full");
+        var id=item.QualifiedItemId;var before=Count(id);var click=menu.ItemsToGrabMenu.inventory[index].bounds.Center;
+        menu.receiveLeftClick(click.X,click.Y);
+        if(menu.heldItem is {} held){
+            var slot=Game1.player.Items.ToList().FindIndex(i=>i!=null&&i.canStackWith(held)&&i.Stack+held.Stack<=i.maximumStackSize());
+            if(slot<0)slot=Game1.player.Items.IndexOf(null);if(slot<0||slot>=menu.inventory.inventory.Count)return End("collection_inventory_full");
+            var target=menu.inventory.inventory[slot].bounds.Center;menu.receiveLeftClick(target.X,target.Y);
+        }
+        var gained=Count(id)-before;
+        if(gained>0){Completed+=gained;return "running";}
+        if(item.IsRecipe&&!menu.ItemsToGrabMenu.actualInventory.Contains(item)){Completed++;return "running";}
+        return End("native_collection_not_verified");
     }
 }

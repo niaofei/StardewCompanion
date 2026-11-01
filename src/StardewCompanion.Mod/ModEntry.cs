@@ -212,7 +212,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 if (status != "running") { Finish(status, _routine.Reason); return; }
                 if (_routine.ProgressDue) { Emit(_active.TaskId, "progress", _routine.Phase, JsonSerializer.Serialize(_routine.BusinessDetails), _routine.Completed); _routine.ProgressSent(); }
             }
-            catch (Exception ex) { Monitor.Log("Routine stopped: " + ex.GetType().Name, LogLevel.Warn); Finish("failed", "routine_exception"); }
+            catch (Exception ex) { Monitor.Log("Routine stopped: " + ex, LogLevel.Warn); Finish("failed", "routine_exception:"+ex.GetType().Name+":"+ex.Message); }
             return;
         }
         if (Environment.TickCount64 >= _endsAt) { Finish("completed", "input_finished"); return; }
@@ -305,7 +305,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             if(!BusinessAvailability.AllowedForDirectLabExecution(command.Skill)){Emit(command.TaskId,"rejected","capability_not_validated_or_unavailable",skill:command.Skill);return;}
             if(business.Query){Emit(command.TaskId,"completed","observation",JsonSerializer.Serialize(BusinessAvailability.Survey(args.RootElement)),skill:command.Skill);return;}
         }
-        if (command.Skill is "observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_opening" or "read_mailbox")
+        if (command.Skill is "observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_area" or "read_mailbox")
         {
             object details = command.Skill switch
             {
@@ -315,9 +315,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     fromMap=e.From,toMap=e.To,exitTile=new{x=e.Tile.X,y=e.Tile.Y},arrivalTile=e.ArrivalTile is {} arrival?new{x=arrival.X,y=arrival.Y}:null,
                     interact=e.Interact,coordinateMeaning="exitTile belongs to fromMap; arrivalTile belongs to toMap"
                 }).ToArray() },
-                "inspect_opening" => !SoloTestMode.Enabled ? new{status="blocked",reason="solo_test_required"}
-                    :Game1.currentLocation.NameOrUniqueName!="Farm"?new{status="blocked",reason="requires_location",requiredLocation="Farm",suggestion="go_to目标地图Farm，坐标64,15；不要走室内门格"}
-                    :OpeningExecutor.InspectPlan(),
+                "inspect_area" => BusinessAvailability.Survey(args.RootElement),
                 "inspect_targets" => WorldView.InspectMany(args.RootElement),
                 _ => WorldView.Read()
             };
@@ -326,8 +324,6 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (_paused || _active != null || _sleepLockedDay == Game1.Date.TotalDays)
         { Emit(command.TaskId, "rejected", _paused ? "paused" : _active != null ? "busy" : "waiting_for_next_day"); return; }
         if(_cleanup!=null) { Emit(command.TaskId,"rejected","container_cleanup_pending");return; }
-        if(OpeningExecutor.Skills.Contains(command.Skill)&&!SoloTestMode.Enabled)
-        {Emit(command.TaskId,"rejected","opening_skills_require_solo_test");return;}
         if (command.Skill == "bind_chest")
         {
             var tile = new Vector2(args.RootElement.GetProperty("x").GetInt32(), args.RootElement.GetProperty("y").GetInt32());

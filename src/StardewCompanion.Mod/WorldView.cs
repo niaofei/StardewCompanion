@@ -56,6 +56,11 @@ internal static class WorldView
             gameEvents=GameEventTracker.Pending(),
             inventoryState=new{capacity=Game1.player.MaxItems,occupiedSlots=Game1.player.Items.Count(i=>i!=null),freeSlots=Math.Max(0,Game1.player.MaxItems-Game1.player.Items.Count(i=>i!=null))},
             inventory = Game1.player.Items.Select((i, slot) => new { slot, id = i?.QualifiedItemId, name = i?.DisplayName, count = i?.Stack ?? 0, tool = i is Tool }),
+            animals=location.animals.Values.Select(a=>new{id=a.myID.Value.ToString(),name=a.displayName,type=a.type.Value,x=a.TilePoint.X,y=a.TilePoint.Y,petted=a.wasPet.Value,homeId=a.home?.id.Value.ToString()}),
+            pets=location.characters.OfType<StardewValley.Characters.Pet>().Select(p=>new{id=p.petId.Value.ToString(),name=p.displayName,x=p.TilePoint.X,y=p.TilePoint.Y,pettedToday=p.lastPetDay.TryGetValue(Game1.player.UniqueMultiplayerID,out var petDay)&&petDay==Game1.Date.TotalDays}),
+            buildings=location.buildings.Select(b=>new{id=b.id.Value.ToString(),type=b.buildingType.Value,x=b.tileX.Value,y=b.tileY.Value,width=b.tilesWide.Value,height=b.tilesHigh.Value,indoors=b.GetIndoors()?.NameOrUniqueName,constructionDaysRemaining=b.daysOfConstructionLeft.Value,bowlWatered=b is StardewValley.Buildings.PetBowl bowl?(bool?)bowl.watered.Value:null}),
+            toolUpgrade=Game1.player.toolBeingUpgraded.Value is {} upgrading?new{toolId=upgrading.QualifiedItemId,level=upgrading.UpgradeLevel,daysRemaining=Game1.player.daysLeftForToolUpgrade.Value}:null,
+            knownRecipes=new{crafting=Game1.player.craftingRecipes.Keys.OrderBy(n=>n).ToArray(),cooking=Game1.player.cookingRecipes.Keys.OrderBy(n=>n).ToArray()},
             players = Game1.getOnlineFarmers().Select(p => new { id = p.UniqueMultiplayerID.ToString(), name = p.Name, location = p.currentLocation?.NameOrUniqueName, x = p.TilePoint.X, y = p.TilePoint.Y }),
             soil = location.terrainFeatures.Pairs.Where(p => p.Value is HoeDirt).Select(p =>
             { var h = (HoeDirt)p.Value; return new { x = (int)p.Key.X, y = (int)p.Key.Y, watered = h.state.Value == 1, crop = h.crop?.indexOfHarvest.Value,
@@ -167,6 +172,7 @@ internal static class WorldView
     internal static bool NeedsWater(HoeDirt dirt,GameLocation location)=>dirt.crop!=null&&!dirt.crop.dead.Value&&dirt.state.Value!=1&&!location.IsRainingHere();
     internal static object Inspect(int x, int y)
     {
+        if(x<0||y<0||x>=Game1.currentLocation.Map.Layers[0].LayerWidth||y>=Game1.currentLocation.Map.Layers[0].LayerHeight)return new{knowledge="out_of_bounds",location=Game1.currentLocation.NameOrUniqueName,x,y};
         var tile = new Vector2(x, y);
         Game1.currentLocation.objects.TryGetValue(tile, out var obj);
         var soil=Game1.currentLocation.terrainFeatures.TryGetValue(tile,out var feature)?feature as HoeDirt:null;
@@ -177,7 +183,8 @@ internal static class WorldView
             chestId = obj?.modData.TryGetValue(ChestKey, out var id) == true ? id : null,
             soil=soil==null?null:new{crop=soil.crop?.indexOfHarvest.Value,dead=soil.crop?.dead.Value??false,watered=soil.state.Value==1,
                 needsWater=NeedsWater(soil,Game1.currentLocation),ready=Ready(soil.crop)},
-            items = obj is Chest chest ? chest.GetItemsForPlayer(Game1.player.UniqueMultiplayerID).Select(i => new { id = i?.QualifiedItemId, count = i?.Stack ?? 0 }).ToArray() : null };
+            storage = obj is Chest container ? new { capacity=container.GetActualCapacity(),occupiedSlots=container.GetItemsForPlayer(Game1.player.UniqueMultiplayerID).Count(i=>i!=null),freeSlots=Math.Max(0,container.GetActualCapacity()-container.GetItemsForPlayer(Game1.player.UniqueMultiplayerID).Count(i=>i!=null)) } : null,
+            items = obj is Chest chest ? chest.GetItemsForPlayer(Game1.player.UniqueMultiplayerID).Where(i=>i!=null).Select(i => new { id = i.QualifiedItemId, count = i.Stack, quality=i.Quality }).ToArray() : null };
     }
     internal static object InspectMany(JsonElement args)
     {
